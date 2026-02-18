@@ -154,7 +154,7 @@ def optimize(request: OptimizationRequest):
     dimension_name = 'Distance'
     routing.AddDimension(transit_callback_index, 0, 99999999, True, dimension_name)
     distance_dimension = routing.GetDimensionOrDie(dimension_name)
-    distance_dimension.SetGlobalSpanCostCoefficient(0) 
+    distance_dimension.SetGlobalSpanCostCoefficient(1) 
 
     # --- ZAMAN ---
     routing.AddDimension(
