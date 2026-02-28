@@ -148,12 +148,43 @@ def optimize(request: OptimizationRequest):
 
     time_callback_index = routing.RegisterTransitCallback(time_callback)
 
-    actual_capacity = request.vehicle_capacity if request.use_capacity else 9999999
-    routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
+    # =========================================================
+    # 🛡️ YENİ: GÖRÜNMEZ BARİYERLER (OTOMATİK YÜK VE DURAK DAĞILIMI)
+    # =========================================================
     
+    # 1. OTOMATİK KAPASİTE FRENİ
+    total_demand = sum(loc["demand"] for loc in locations)
+    if request.use_capacity:
+        actual_capacity = request.vehicle_capacity
+    else:
+        # Kullanıcı kapasiteyi kapattıysa, gizli bir adalet sınırı koy (%40 esneklik ile)
+        if total_demand > 0:
+            actual_capacity = int((total_demand / request.vehicle_count) * 2)
+        else:
+            actual_capacity = 9999999
+
+    routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
+
+    # 2. OTOMATİK DURAK FRENİ (Sonsuz kapasite ve 0 yük durumunda şoförü korur)
+    # Örn: 100 durak / 5 araç = 20 ortalama. 20 * 1.6 = 32 maksimum durak!
+    max_stops = int((len(locations) / request.vehicle_count) * 2)
+    if max_stops < 15: 
+        max_stops = len(locations) + 1 # Veri çok ufaksa limiti kaldır
+
+    def stop_count_callback(from_index):
+        return 1
+    stop_count_callback_index = routing.RegisterUnaryTransitCallback(stop_count_callback)
+    routing.AddDimension(
+        stop_count_callback_index,
+        0,          # slack
+        max_stops,  # Bir aracın gidebileceği gizli maksimum durak sınırı
+        True,       # start cumul to zero
+        'StopCount'
+    )
+    # =========================================================
+
     routing.AddDimension(transit_callback_index, 0, 99999999, True, 'Distance')
-    # SPAGETTİ ÇÖZÜMÜ 1: Katsayı 0 yapıldı (Kümelenmeyi bozmasın diye)
-    routing.GetDimensionOrDie('Distance').SetGlobalSpanCostCoefficient(0) 
+    routing.GetDimensionOrDie('Distance').SetGlobalSpanCostCoefficient(0)
     
     routing.AddDimension(time_callback_index, 99999, 99999, False, 'Time')
     time_dimension = routing.GetDimensionOrDie('Time')
