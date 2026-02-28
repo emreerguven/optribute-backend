@@ -23,7 +23,10 @@ class OptimizationRequest(BaseModel):
     vehicle_capacity: int = 1000  
     jobs: List[Job]
     use_capacity: bool = True 
-    open_path: bool = False # YENİ: Açık Rota Parametresi
+    open_path: bool = False
+
+class PreviewRequest(BaseModel):
+    jobs: List[Job]
 
 OSRM_BASE_URL = "http://router.project-osrm.org"
 SERVICE_TIME = 10 
@@ -60,8 +63,8 @@ def get_route_geometry(path_locations):
 def generate_map_html(jobs, result_json):
     if not result_json.get("routes"): return "<h1>Rota yok</h1>"
     center_lat, center_lon = jobs[0].lat, jobs[0].lon
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
-    colors = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue"]
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
+    colors = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue", "darkblue", "darkgreen", "cadetblue"]
 
     for i, route in enumerate(result_json["routes"]):
         path = route["path"]
@@ -95,6 +98,24 @@ def generate_map_html(jobs, result_json):
                 folium.Marker([lat, lon], tooltip=f"Durak {display_num}: {demand} Kg | Saat: {arrival}", opacity=0).add_to(m)
     return m.get_root().render()
 
+@app.post("/preview")
+def preview_map(request: PreviewRequest):
+    locations = request.jobs
+    if not locations:
+        raise HTTPException(status_code=400, detail="Konum bulunamadı")
+
+    center_lat = locations[0].lat
+    center_lon = locations[0].lon
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
+
+    for loc in locations:
+        if loc.id == 0:
+            folium.Marker([loc.lat, loc.lon], tooltip="MERKEZ DEPO", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
+        else:
+            folium.Marker([loc.lat, loc.lon], tooltip=f"Durak ID: {loc.id} | Yük: {loc.demand} kg", icon=folium.Icon(color="blue", icon="info-sign")).add_to(m)
+
+    return {"status": "success", "map_html": m.get_root().render()}
+
 @app.post("/optimize")
 def optimize(request: OptimizationRequest):
     locations = [{"lat": j.lat, "lon": j.lon, "id": j.id, "demand": j.demand, "time_start": j.time_start, "time_end": j.time_end} for j in request.jobs]
@@ -108,7 +129,7 @@ def optimize(request: OptimizationRequest):
 
     def distance_callback(from_index, to_index):
         from_node, to_node = manager.IndexToNode(from_index), manager.IndexToNode(to_index)
-        if request.open_path and to_node == 0: return 0 # YENİ: Dönüş bedava
+        if request.open_path and to_node == 0: return 0 
         return distance_matrix[from_node][to_node]
 
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
@@ -122,15 +143,17 @@ def optimize(request: OptimizationRequest):
     def time_callback(from_index, to_index):
         from_node, to_node = manager.IndexToNode(from_index), manager.IndexToNode(to_index)
         if from_node == to_node: return 0
-        if request.open_path and to_node == 0: return 0 # YENİ: Dönüş zamanı sıfır
+        if request.open_path and to_node == 0: return 0 
         return duration_matrix[from_node][to_node] + SERVICE_TIME
 
     time_callback_index = routing.RegisterTransitCallback(time_callback)
 
     actual_capacity = request.vehicle_capacity if request.use_capacity else 9999999
     routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
+    
     routing.AddDimension(transit_callback_index, 0, 99999999, True, 'Distance')
-    routing.GetDimensionOrDie('Distance').SetGlobalSpanCostCoefficient(1) 
+    # SPAGETTİ ÇÖZÜMÜ 1: Katsayı 0 yapıldı (Kümelenmeyi bozmasın diye)
+    routing.GetDimensionOrDie('Distance').SetGlobalSpanCostCoefficient(0) 
     
     routing.AddDimension(time_callback_index, 99999, 99999, False, 'Time')
     time_dimension = routing.GetDimensionOrDie('Time')
@@ -147,9 +170,11 @@ def optimize(request: OptimizationRequest):
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    # SPAGETTİ ÇÖZÜMÜ 2: Mükemmel Coğrafi Kümeleme
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_parameters.time_limit.seconds = 5 
+    # SPAGETTİ ÇÖZÜMÜ 3: Stres testi ve büyük veriler için 30 saniye
+    search_parameters.time_limit.seconds = 30 
 
     solution = routing.SolveWithParameters(search_parameters)
 
@@ -174,14 +199,13 @@ def optimize(request: OptimizationRequest):
                 routes_json.append({"vehicle_id": vehicle_id + 1, "path": [], "geometry": [], "total_km": 0, "total_load": 0})
                 continue
 
-            # YENİ: Eğer açık rota DEĞİLSE depoyu son durak olarak ekle
+            # Açık rota değilse depoya dönüşü ekle
             if not request.open_path:
                 arrival_min = solution.Min(time_dimension.CumulVar(index))
                 arr_str = f"{(arrival_min // 60) % 24:02d}:{arrival_min % 60:02d}"
                 path_stops.append({"lat": depot.lat, "lon": depot.lon, "id": depot.id, "demand": 0, "arrival_time": arr_str})
             
             geometry, true_distance = get_route_geometry(path_stops)
-
             formatted_path = [{"order": i + 1, "lat": s["lat"], "lon": s["lon"], "original_id": s["id"], "demand": s["demand"], "arrival_time": s["arrival_time"]} for i, s in enumerate(path_stops)]
 
             routes_json.append({
