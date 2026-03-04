@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Tuple
 from folium.features import DivIcon
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import requests
 import folium
 import polyline
+import math
 
 app = FastAPI()
 
@@ -15,63 +16,192 @@ class Job(BaseModel):
     lat: float
     lon: float
     demand: int = 0
-    time_start: int = 480  
-    time_end: int = 1080   
+    time_start: int = 480
+    time_end: int = 1080
 
 class OptimizationRequest(BaseModel):
     vehicle_count: int
-    vehicle_capacity: int = 1000  
+    vehicle_capacity: int = 1000
     jobs: List[Job]
-    use_capacity: bool = True 
+    use_capacity: bool = True
     open_path: bool = False
 
 class PreviewRequest(BaseModel):
     jobs: List[Job]
 
 OSRM_BASE_URL = "http://router.project-osrm.org"
-SERVICE_TIME = 10 
+SERVICE_TIME = 10
 
+# ─────────────────────────────────────────────
+# OSRM
+# ─────────────────────────────────────────────
 def get_osrm_matrices(locations):
     coordinates = [f"{loc['lon']},{loc['lat']}" for loc in locations]
     coord_string = ";".join(coordinates)
     url = f"{OSRM_BASE_URL}/table/v1/driving/{coord_string}?annotations=distance,duration"
-    try:
-        response = requests.get(url)
-        if response.status_code != 200: raise Exception("OSRM Hatası")
-        data = response.json()
-        dist_matrix = [[int(val) if val is not None else 1000000 for val in row] for row in data["distances"]]
-        dur_matrix = [[int(val/60) if val is not None else 999 for val in row] for row in data["durations"]]
-        return dist_matrix, dur_matrix
-    except Exception as e:
-        raise e
+    response = requests.get(url, timeout=15)
+    if response.status_code != 200:
+        raise Exception("OSRM Hatası")
+    data = response.json()
+    dist_matrix = [[int(v) if v is not None else 10_000_000 for v in row] for row in data["distances"]]
+    dur_matrix  = [[int(v / 60) if v is not None else 9_999 for v in row] for row in data["durations"]]
+    return dist_matrix, dur_matrix
 
 def get_route_geometry(path_locations):
-    if len(path_locations) < 2: return [], 0
+    if len(path_locations) < 2:
+        return [], 0
     coords = [f"{loc['lon']},{loc['lat']}" for loc in path_locations]
-    coord_string = ";".join(coords)
-    url = f"{OSRM_BASE_URL}/route/v1/driving/{coord_string}?overview=full&geometries=polyline"
+    url = f"{OSRM_BASE_URL}/route/v1/driving/{';'.join(coords)}?overview=full&geometries=polyline"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=15)
         if response.status_code == 200:
             data = response.json()
-            if "routes" in data and len(data["routes"]) > 0:
+            if data.get("routes"):
                 route = data["routes"][0]
                 return polyline.decode(route["geometry"]), route["distance"]
-    except: pass
+    except Exception:
+        pass
     return [], 0
 
+# ─────────────────────────────────────────────
+# ANTİ-SPAGETTİ: 2-OPT CROSSING REMOVAL
+# Kağıt üzerinde iki kenar kesişiyorsa swap yap
+# ─────────────────────────────────────────────
+def _segments_intersect(p1, p2, p3, p4) -> bool:
+    """İki line segment kesişiyor mu? (lat/lon koordinatlarında)"""
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    d1 = cross(p3, p4, p1)
+    d2 = cross(p3, p4, p2)
+    d3 = cross(p1, p2, p3)
+    d4 = cross(p1, p2, p4)
+
+    if ((d1 > 0 < d2) or (d1 < 0 > d2)) and \
+       ((d3 > 0 < d4) or (d3 < 0 > d4)):
+        return True
+    return False
+
+def euclidean(a, b) -> float:
+    return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+def two_opt_single_route(route: List[dict]) -> List[dict]:
+    """Tek rota içi 2-opt: iç kesişimleri ve gereksiz zigzag'ları gider."""
+    coords = [(s["lat"], s["lon"]) for s in route]
+    n = len(coords)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, n - 2):
+            for j in range(i + 1, n - 1):
+                # Segment [i-1,i] ile [j, j+1] kesişiyor mu?
+                if _segments_intersect(coords[i-1], coords[i], coords[j], coords[j+1]):
+                    # Ters çevir
+                    coords[i:j+1] = coords[i:j+1][::-1]
+                    route[i:j+1]  = route[i:j+1][::-1]
+                    improved = True
+    return route
+
+def or_opt_single_route(route: List[dict]) -> List[dict]:
+    """Or-opt: tek durakları en ucuz yere taşı."""
+    coords = [(s["lat"], s["lon"]) for s in route]
+    n = len(coords)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, n - 1):          # taşınacak durak
+            best_gain = 0
+            best_j    = -1
+            ci = coords[i]
+            prev_i = coords[i - 1]
+            next_i = coords[i + 1]
+            # Mevcut maliyet: prev_i→ci + ci→next_i
+            current_cost = euclidean(prev_i, ci) + euclidean(ci, next_i)
+            # prev_i→next_i (boşluk maliyeti)
+            gap_cost = euclidean(prev_i, next_i)
+
+            for j in range(1, n - 1):
+                if abs(j - i) <= 1:
+                    continue
+                cj      = coords[j]
+                cj_next = coords[j + 1] if j + 1 < n else coords[j]
+                insert_cost = euclidean(cj, ci) + euclidean(ci, cj_next) - euclidean(cj, cj_next)
+                gain = (current_cost - gap_cost) - insert_cost
+                if gain > best_gain:
+                    best_gain = gain
+                    best_j    = j
+
+            if best_j != -1:
+                node = route.pop(i)
+                coords.pop(i)
+                insert_pos = best_j if best_j < i else best_j
+                route.insert(insert_pos, node)
+                coords.insert(insert_pos, (node["lat"], node["lon"]))
+                improved = True
+                break
+    return route
+
+def inter_route_two_opt(routes_stops: List[List[dict]]) -> List[List[dict]]:
+    """
+    Rotalar ARASI kesişim tespiti ve düzeltme.
+    Her iki rota çiftinde kesişen kenar bulunursa uç noktaları swap et.
+    """
+    n_routes = len(routes_stops)
+    improved = True
+    max_iter = 20  # sonsuz döngü koruması
+    iteration = 0
+
+    while improved and iteration < max_iter:
+        improved = False
+        iteration += 1
+        for r1 in range(n_routes):
+            for r2 in range(r1 + 1, n_routes):
+                s1 = routes_stops[r1]
+                s2 = routes_stops[r2]
+                if len(s1) < 2 or len(s2) < 2:
+                    continue
+
+                found = False
+                for i in range(len(s1) - 1):
+                    if found:
+                        break
+                    p1 = (s1[i]["lat"],     s1[i]["lon"])
+                    p2 = (s1[i+1]["lat"],   s1[i+1]["lon"])
+
+                    for j in range(len(s2) - 1):
+                        p3 = (s2[j]["lat"],   s2[j]["lon"])
+                        p4 = (s2[j+1]["lat"], s2[j+1]["lon"])
+
+                        if _segments_intersect(p1, p2, p3, p4):
+                            # Swap: s1[i+1:] ve s2[j+1:] yi değiştir
+                            tail1 = s1[i+1:]
+                            tail2 = s2[j+1:]
+                            routes_stops[r1] = s1[:i+1] + tail2
+                            routes_stops[r2] = s2[:j+1] + tail1
+                            improved = True
+                            found = True
+                            break
+
+    return routes_stops
+
+# ─────────────────────────────────────────────
+# HARİTA
+# ─────────────────────────────────────────────
 def generate_map_html(jobs, result_json):
-    if not result_json.get("routes"): return "<h1>Rota yok</h1>"
+    if not result_json.get("routes"):
+        return "<h1>Rota yok</h1>"
     center_lat, center_lon = jobs[0].lat, jobs[0].lon
     m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
-    colors = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue", "darkblue", "darkgreen", "cadetblue"]
+    colors = ["red","blue","green","purple","orange","darkred",
+              "cadetblue","darkblue","darkgreen","pink","lightred","beige"]
 
     for i, route in enumerate(result_json["routes"]):
-        path = route["path"]
-        geometry = route.get("geometry", [])
-        color = colors[i % len(colors)]
-        total_load = route.get("total_load", 0) 
-        if not path: continue
+        path      = route["path"]
+        geometry  = route.get("geometry", [])
+        color     = colors[i % len(colors)]
+        total_load = route.get("total_load", 0)
+        if not path:
+            continue
 
         if geometry:
             folium.PolyLine(
@@ -81,23 +211,38 @@ def generate_map_html(jobs, result_json):
 
         for stop in path:
             orj_id, lat, lon = stop["original_id"], stop["lat"], stop["lon"]
-            order, demand, arrival = stop["order"], stop.get("demand", 0), stop.get("arrival_time", "")
+            order  = stop["order"]
+            demand = stop.get("demand", 0)
+            arrival = stop.get("arrival_time", "")
 
             if orj_id == 0:
                 if order == 1:
-                    folium.Marker([lat, lon], popup="DEPO (Çıkış)", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
+                    folium.Marker(
+                        [lat, lon], popup="DEPO (Çıkış)",
+                        icon=folium.Icon(color="black", icon="home", prefix="fa")
+                    ).add_to(m)
             else:
                 display_num = order - 1
                 folium.Marker(
                     [lat, lon],
                     icon=DivIcon(
                         icon_size=(30, 30), icon_anchor=(15, 15),
-                        html=f'<div style="font-size: 11pt; font-weight: bold; color: {color}; background-color: white; border: 2px solid {color}; border-radius: 50%; width: 30px; height: 30px; text-align: center; line-height: 26px;">{display_num}</div>'
+                        html=f'<div style="font-size:11pt;font-weight:bold;color:{color};'
+                             f'background:white;border:2px solid {color};border-radius:50%;'
+                             f'width:30px;height:30px;text-align:center;line-height:26px;">'
+                             f'{display_num}</div>'
                     )
                 ).add_to(m)
-                folium.Marker([lat, lon], tooltip=f"Durak {display_num}: {demand} Kg | Saat: {arrival}", opacity=0).add_to(m)
+                folium.Marker(
+                    [lat, lon],
+                    tooltip=f"Durak {display_num}: {demand} Kg | Saat: {arrival}",
+                    opacity=0
+                ).add_to(m)
     return m.get_root().render()
 
+# ─────────────────────────────────────────────
+# ENDPOINTS
+# ─────────────────────────────────────────────
 @app.post("/preview")
 def preview_map(request: PreviewRequest):
     locations = request.jobs
@@ -110,136 +255,203 @@ def preview_map(request: PreviewRequest):
 
     for loc in locations:
         if loc.id == 0:
-            folium.Marker([loc.lat, loc.lon], tooltip="MERKEZ DEPO", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
+            folium.Marker(
+                [loc.lat, loc.lon], tooltip="MERKEZ DEPO",
+                icon=folium.Icon(color="black", icon="home", prefix="fa")
+            ).add_to(m)
         else:
-            folium.Marker([loc.lat, loc.lon], tooltip=f"Durak ID: {loc.id} | Yük: {loc.demand} kg", icon=folium.Icon(color="blue", icon="info-sign")).add_to(m)
+            folium.Marker(
+                [loc.lat, loc.lon],
+                tooltip=f"Durak ID: {loc.id} | Yük: {loc.demand} kg",
+                icon=folium.Icon(color="blue", icon="info-sign")
+            ).add_to(m)
 
     return {"status": "success", "map_html": m.get_root().render()}
 
+
 @app.post("/optimize")
 def optimize(request: OptimizationRequest):
-    locations = [{"lat": j.lat, "lon": j.lon, "id": j.id, "demand": j.demand, "time_start": j.time_start, "time_end": j.time_end} for j in request.jobs]
+    locations = [
+        {
+            "lat": j.lat, "lon": j.lon, "id": j.id,
+            "demand": j.demand,
+            "time_start": j.time_start, "time_end": j.time_end
+        }
+        for j in request.jobs
+    ]
+
     try:
         distance_matrix, duration_matrix = get_osrm_matrices(locations)
-    except:
+    except Exception:
         raise HTTPException(status_code=500, detail="Harita servisi hatası")
 
-    manager = pywrapcp.RoutingIndexManager(len(locations), request.vehicle_count, 0)
+    n          = len(locations)
+    k          = request.vehicle_count
+
+    # ── OR-Tools kurulumu ──────────────────────────────────
+    manager = pywrapcp.RoutingIndexManager(n, k, 0)
     routing = pywrapcp.RoutingModel(manager)
 
+    # Mesafe callback
     def distance_callback(from_index, to_index):
-        from_node, to_node = manager.IndexToNode(from_index), manager.IndexToNode(to_index)
-        if request.open_path and to_node == 0: return 0 
-        return distance_matrix[from_node][to_node]
+        fn = manager.IndexToNode(from_index)
+        tn = manager.IndexToNode(to_index)
+        if request.open_path and tn == 0:
+            return 0
+        return distance_matrix[fn][tn]
 
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    transit_cb = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
 
+    # Kapasite callback
     def demand_callback(from_index):
-        from_node = manager.IndexToNode(from_index)
-        return locations[from_node]["demand"]
-    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+        return locations[manager.IndexToNode(from_index)]["demand"]
 
-    def time_callback(from_index, to_index):
-        from_node, to_node = manager.IndexToNode(from_index), manager.IndexToNode(to_index)
-        if from_node == to_node: return 0
-        if request.open_path and to_node == 0: return 0 
-        return duration_matrix[from_node][to_node] + SERVICE_TIME
-
-    time_callback_index = routing.RegisterTransitCallback(time_callback)
-
-    # =========================================================
-    # 🛡️ GÖRÜNMEZ BARİYERLER (SADECE DURAK DAĞILIMI)
-    # =========================================================
-    
-    # 1. KAPASİTE AYARI (Gizli limit kaldırıldı)
-    if request.use_capacity:
-        actual_capacity = request.vehicle_capacity
-    else:
-        actual_capacity = 9999999 # Sınır tamamen kaldırıldı, sonsuz kapasite
-
-    routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
-
-    # 2. OTOMATİK DURAK FRENİ (Sonsuz kapasite durumunda şoförü korur)
-    max_stops = int((len(locations) / request.vehicle_count) * 3)
-    if max_stops < 15: 
-        max_stops = len(locations) + 1 # Veri çok ufaksa limiti kaldır
-
-    def stop_count_callback(from_index):
-        return 1
-    stop_count_callback_index = routing.RegisterUnaryTransitCallback(stop_count_callback)
-    routing.AddDimension(
-        stop_count_callback_index,
-        0,          # slack
-        max_stops,  # Bir aracın gidebileceği gizli maksimum durak sınırı
-        True,       # start cumul to zero
-        'StopCount'
+    demand_cb = routing.RegisterUnaryTransitCallback(demand_callback)
+    actual_capacity = request.vehicle_capacity if request.use_capacity else 10_000_000
+    routing.AddDimensionWithVehicleCapacity(
+        demand_cb, 0, [actual_capacity] * k, True, "Capacity"
     )
-    # =========================================================
 
-    routing.AddDimension(transit_callback_index, 0, 99999999, True, 'Distance')
-    routing.GetDimensionOrDie('Distance').SetGlobalSpanCostCoefficient(0)
-    
-    routing.AddDimension(time_callback_index, 99999, 99999, False, 'Time')
-    time_dimension = routing.GetDimensionOrDie('Time')
+    # Zaman callback
+    def time_callback(from_index, to_index):
+        fn = manager.IndexToNode(from_index)
+        tn = manager.IndexToNode(to_index)
+        if fn == tn:
+            return 0
+        if request.open_path and tn == 0:
+            return 0
+        return duration_matrix[fn][tn] + SERVICE_TIME
 
-    for vehicle_id in range(request.vehicle_count):
-        time_dimension.CumulVar(routing.Start(vehicle_id)).SetValue(480)
+    time_cb = routing.RegisterTransitCallback(time_callback)
+    routing.AddDimension(time_cb, 9_999, 9_999, False, "Time")
+    time_dim = routing.GetDimensionOrDie("Time")
 
-    for i in range(1, len(locations)): 
-        index = manager.NodeToIndex(i)
-        start_t, end_t = locations[i]["time_start"], locations[i]["time_end"]
-        if start_t > end_t: start_t, end_t = end_t, start_t
-        if start_t != 480 or end_t != 1080:
-            time_dimension.CumulVar(index).SetMin(start_t)
-            time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
+    for vid in range(k):
+        time_dim.CumulVar(routing.Start(vid)).SetValue(480)
 
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_parameters.time_limit.seconds = 30 
+    for i in range(1, n):
+        idx = manager.NodeToIndex(i)
+        ts, te = locations[i]["time_start"], locations[i]["time_end"]
+        if ts > te:
+            ts, te = te, ts
+        # Soft time window — ceza katsayısı 200
+        time_dim.CumulVar(idx).SetMin(ts)
+        time_dim.SetCumulVarSoftUpperBound(idx, te, 200)
 
-    solution = routing.SolveWithParameters(search_parameters)
+    # Mesafe dimension — makespan dengelemek için
+    routing.AddDimension(transit_cb, 0, 999_999_999, True, "Distance")
+    dist_dim = routing.GetDimensionOrDie("Distance")
 
-    if solution:
-        routes_json = []
-        depot = request.jobs[0]
+    # ★ MAKESPAN DENGELEYİCİ
+    # 0 → tamamen görmezden gel (eski), 150 → dengeli
+    dist_dim.SetGlobalSpanCostCoefficient(150)
 
-        for vehicle_id in range(request.vehicle_count):
-            index = routing.Start(vehicle_id)
-            path_stops = []
-            vehicle_load = 0 
+    # ── Arama parametreleri ────────────────────────────────
+    params = pywrapcp.DefaultRoutingSearchParameters()
 
-            while not routing.IsEnd(index):
-                arrival_min = solution.Min(time_dimension.CumulVar(index)) 
-                arr_str = f"{(arrival_min // 60) % 24:02d}:{arrival_min % 60:02d}"
-                loc = locations[manager.IndexToNode(index)]
-                vehicle_load += loc["demand"]  
-                path_stops.append({"lat": loc["lat"], "lon": loc["lon"], "id": loc["id"], "demand": loc["demand"], "arrival_time": arr_str})
-                index = solution.Value(routing.NextVar(index))
+    # PATH_CHEAPEST_ARC coğrafi lokalite sağlar → daha az crossing
+    params.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    # GLS en iyi local search — değiştirme
+    params.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
+    params.time_limit.seconds = 45   # 30 → 45sn, daha iyi çözüm
+    params.solution_limit      = 200  # fazla çözüm denemesi
 
-            if len(path_stops) <= 1:
-                routes_json.append({"vehicle_id": vehicle_id + 1, "path": [], "geometry": [], "total_km": 0, "total_load": 0})
-                continue
+    solution = routing.SolveWithParameters(params)
 
-            # Açık rota değilse depoya dönüşü ekle
-            if not request.open_path:
-                arrival_min = solution.Min(time_dimension.CumulVar(index))
-                arr_str = f"{(arrival_min // 60) % 24:02d}:{arrival_min % 60:02d}"
-                path_stops.append({"lat": depot.lat, "lon": depot.lon, "id": depot.id, "demand": 0, "arrival_time": arr_str})
-            
-            geometry, true_distance = get_route_geometry(path_stops)
-            formatted_path = [{"order": i + 1, "lat": s["lat"], "lon": s["lon"], "original_id": s["id"], "demand": s["demand"], "arrival_time": s["arrival_time"]} for i, s in enumerate(path_stops)]
+    if not solution:
+        raise HTTPException(status_code=400, detail="Rota bulunamadı!")
 
-            routes_json.append({
-                "vehicle_id": vehicle_id + 1,
-                "path": formatted_path,
-                "geometry": geometry,
-                "total_km": round(true_distance / 1000, 2),
-                "total_load": vehicle_load
+    # ── Ham rotaları çıkar ────────────────────────────────
+    depot = request.jobs[0]
+    raw_routes: List[List[dict]] = []
+
+    for vid in range(k):
+        idx    = routing.Start(vid)
+        stops  = []
+        v_load = 0
+
+        while not routing.IsEnd(idx):
+            arr_min = solution.Min(time_dim.CumulVar(idx))
+            arr_str = f"{(arr_min // 60) % 24:02d}:{arr_min % 60:02d}"
+            loc     = locations[manager.IndexToNode(idx)]
+            v_load += loc["demand"]
+            stops.append({
+                "lat": loc["lat"], "lon": loc["lon"],
+                "id":  loc["id"],  "demand": loc["demand"],
+                "arrival_time": arr_str
+            })
+            idx = solution.Value(routing.NextVar(idx))
+
+        if len(stops) <= 1:
+            raw_routes.append([])
+            continue
+
+        if not request.open_path:
+            arr_min = solution.Min(time_dim.CumulVar(idx))
+            arr_str = f"{(arr_min // 60) % 24:02d}:{arr_min % 60:02d}"
+            stops.append({
+                "lat": depot.lat, "lon": depot.lon,
+                "id": depot.id, "demand": 0,
+                "arrival_time": arr_str
             })
 
-        result_data = {"status": "success", "routes": routes_json}
-        result_data["map_html"] = generate_map_html(request.jobs, result_data)
-        return result_data
-    raise HTTPException(status_code=400, detail="Rota bulunamadı!")
+        raw_routes.append(stops)
+
+    # ── POST-PROCESSING: Anti-Spaghetti ───────────────────
+
+    # 1. Her rota kendi içi 2-opt (iç kesişimler)
+    non_empty = [r for r in raw_routes if r]
+    processed = [two_opt_single_route(r) for r in non_empty]
+
+    # 2. Or-opt: durakları daha iyi yere taşı
+    processed = [or_opt_single_route(r) for r in processed]
+
+    # 3. Rotalar arası crossing removal
+    processed = inter_route_two_opt(processed)
+
+    # ── Sonucu formatla ──────────────────────────────────
+    routes_json = []
+    proc_idx    = 0
+
+    for vid in range(k):
+        if not raw_routes[vid]:
+            routes_json.append({
+                "vehicle_id": vid + 1,
+                "path": [], "geometry": [], "total_km": 0, "total_load": 0
+            })
+            continue
+
+        stops     = processed[proc_idx]
+        proc_idx += 1
+        v_load    = sum(s["demand"] for s in stops)
+
+        geometry, true_distance = get_route_geometry(stops)
+
+        formatted = [
+            {
+                "order":       i + 1,
+                "lat":         s["lat"],
+                "lon":         s["lon"],
+                "original_id": s["id"],
+                "demand":      s["demand"],
+                "arrival_time": s["arrival_time"]
+            }
+            for i, s in enumerate(stops)
+        ]
+
+        routes_json.append({
+            "vehicle_id": vid + 1,
+            "path":       formatted,
+            "geometry":   geometry,
+            "total_km":   round(true_distance / 1000, 2),
+            "total_load": v_load
+        })
+
+    result = {"status": "success", "routes": routes_json}
+    result["map_html"] = generate_map_html(request.jobs, result)
+    return result
