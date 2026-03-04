@@ -149,24 +149,18 @@ def optimize(request: OptimizationRequest):
     time_callback_index = routing.RegisterTransitCallback(time_callback)
 
     # =========================================================
-    # 🛡️ YENİ: GÖRÜNMEZ BARİYERLER (OTOMATİK YÜK VE DURAK DAĞILIMI)
+    # 🛡️ GÖRÜNMEZ BARİYERLER (SADECE DURAK DAĞILIMI)
     # =========================================================
     
-    # 1. OTOMATİK KAPASİTE FRENİ
-    total_demand = sum(loc["demand"] for loc in locations)
+    # 1. KAPASİTE AYARI (Gizli limit kaldırıldı)
     if request.use_capacity:
         actual_capacity = request.vehicle_capacity
     else:
-        # Kullanıcı kapasiteyi kapattıysa, gizli bir adalet sınırı koy (%40 esneklik ile)
-        if total_demand > 0:
-            actual_capacity = int((total_demand / request.vehicle_count) * 2)
-        else:
-            actual_capacity = 9999999
+        actual_capacity = 9999999 # Sınır tamamen kaldırıldı, sonsuz kapasite
 
     routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
 
-    # 2. OTOMATİK DURAK FRENİ (Sonsuz kapasite ve 0 yük durumunda şoförü korur)
-    # Örn: 100 durak / 5 araç = 20 ortalama. 20 * 1.6 = 32 maksimum durak!
+    # 2. OTOMATİK DURAK FRENİ (Sonsuz kapasite durumunda şoförü korur)
     max_stops = int((len(locations) / request.vehicle_count) * 2)
     if max_stops < 15: 
         max_stops = len(locations) + 1 # Veri çok ufaksa limiti kaldır
@@ -201,10 +195,8 @@ def optimize(request: OptimizationRequest):
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    # SPAGETTİ ÇÖZÜMÜ 2: Mükemmel Coğrafi Kümeleme
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    # SPAGETTİ ÇÖZÜMÜ 3: Stres testi ve büyük veriler için 30 saniye
     search_parameters.time_limit.seconds = 30 
 
     solution = routing.SolveWithParameters(search_parameters)
