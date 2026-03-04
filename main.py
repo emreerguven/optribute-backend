@@ -85,48 +85,59 @@ def _segments_intersect(p1, p2, p3, p4) -> bool:
 def euclidean(a, b) -> float:
     return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
 
-def two_opt_single_route(route: List[dict]) -> List[dict]:
-    """Tek rota içi 2-opt: iç kesişimleri ve gereksiz zigzag'ları gider."""
+def two_opt_single_route(route: List[dict], max_passes: int = 3) -> List[dict]:
+    """
+    Tek rota içi 2-opt.
+    max_passes: 50+ durakta sonsuz döngüyü önler, 3 geçiş yeterli.
+    """
     coords = [(s["lat"], s["lon"]) for s in route]
     n = len(coords)
-    improved = True
-    while improved:
+
+    for _ in range(max_passes):
         improved = False
         for i in range(1, n - 2):
             for j in range(i + 1, n - 1):
-                # Segment [i-1,i] ile [j, j+1] kesişiyor mu?
-                if _segments_intersect(coords[i-1], coords[i], coords[j], coords[j+1]):
-                    # Ters çevir
+                if _segments_intersect(
+                    coords[i-1], coords[i], coords[j], coords[j+1]
+                ):
                     coords[i:j+1] = coords[i:j+1][::-1]
                     route[i:j+1]  = route[i:j+1][::-1]
                     improved = True
+        if not improved:
+            break
     return route
 
-def or_opt_single_route(route: List[dict]) -> List[dict]:
-    """Or-opt: tek durakları en ucuz yere taşı."""
+def or_opt_single_route(route: List[dict], max_passes: int = 2) -> List[dict]:
+    """
+    Or-opt: tek durakları daha ucuz yere taşı.
+    max_passes: 2 geçiş 50+ durakta makul sürede biter.
+    """
     coords = [(s["lat"], s["lon"]) for s in route]
     n = len(coords)
-    improved = True
-    while improved:
+
+    for _ in range(max_passes):
         improved = False
-        for i in range(1, n - 1):          # taşınacak durak
-            best_gain = 0
-            best_j    = -1
-            ci = coords[i]
+        for i in range(1, n - 1):
+            ci     = coords[i]
             prev_i = coords[i - 1]
             next_i = coords[i + 1]
-            # Mevcut maliyet: prev_i→ci + ci→next_i
             current_cost = euclidean(prev_i, ci) + euclidean(ci, next_i)
-            # prev_i→next_i (boşluk maliyeti)
-            gap_cost = euclidean(prev_i, next_i)
+            gap_cost     = euclidean(prev_i, next_i)
+            savings      = current_cost - gap_cost  # bu durak kaldırılınca kazanç
+
+            best_gain = 0
+            best_j    = -1
 
             for j in range(1, n - 1):
                 if abs(j - i) <= 1:
                     continue
                 cj      = coords[j]
-                cj_next = coords[j + 1] if j + 1 < n else coords[j]
-                insert_cost = euclidean(cj, ci) + euclidean(ci, cj_next) - euclidean(cj, cj_next)
-                gain = (current_cost - gap_cost) - insert_cost
+                cj_next = coords[min(j + 1, n - 1)]
+                insert_cost = (
+                    euclidean(cj, ci) + euclidean(ci, cj_next)
+                    - euclidean(cj, cj_next)
+                )
+                gain = savings - insert_cost
                 if gain > best_gain:
                     best_gain = gain
                     best_j    = j
@@ -138,22 +149,26 @@ def or_opt_single_route(route: List[dict]) -> List[dict]:
                 route.insert(insert_pos, node)
                 coords.insert(insert_pos, (node["lat"], node["lon"]))
                 improved = True
-                break
+                break   # Bu geçişte bir taşıma yaptık, başa dön
+
+        if not improved:
+            break
     return route
 
 def inter_route_two_opt(routes_stops: List[List[dict]]) -> List[List[dict]]:
     """
-    Rotalar ARASI kesişim tespiti ve düzeltme.
-    Her iki rota çiftinde kesişen kenar bulunursa uç noktaları swap et.
+    Rotalar ARASI kesişim tespiti.
+    max_iter=5 ile sınırlandırıldı — 50+ durakta kabul edilebilir süre.
     """
     n_routes = len(routes_stops)
-    improved = True
-    max_iter = 20  # sonsuz döngü koruması
+    max_iter = 5
     iteration = 0
+    improved  = True
 
     while improved and iteration < max_iter:
-        improved = False
+        improved  = False
         iteration += 1
+
         for r1 in range(n_routes):
             for r2 in range(r1 + 1, n_routes):
                 s1 = routes_stops[r1]
@@ -165,21 +180,20 @@ def inter_route_two_opt(routes_stops: List[List[dict]]) -> List[List[dict]]:
                 for i in range(len(s1) - 1):
                     if found:
                         break
-                    p1 = (s1[i]["lat"],     s1[i]["lon"])
-                    p2 = (s1[i+1]["lat"],   s1[i+1]["lon"])
+                    p1 = (s1[i]["lat"],   s1[i]["lon"])
+                    p2 = (s1[i+1]["lat"], s1[i+1]["lon"])
 
                     for j in range(len(s2) - 1):
                         p3 = (s2[j]["lat"],   s2[j]["lon"])
                         p4 = (s2[j+1]["lat"], s2[j+1]["lon"])
 
                         if _segments_intersect(p1, p2, p3, p4):
-                            # Swap: s1[i+1:] ve s2[j+1:] yi değiştir
                             tail1 = s1[i+1:]
                             tail2 = s2[j+1:]
                             routes_stops[r1] = s1[:i+1] + tail2
                             routes_stops[r2] = s2[:j+1] + tail1
                             improved = True
-                            found = True
+                            found    = True
                             break
 
     return routes_stops
@@ -358,8 +372,8 @@ def optimize(request: OptimizationRequest):
     params.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    params.time_limit.seconds = 45   # 30 → 45sn, daha iyi çözüm
-    params.solution_limit      = 200  # fazla çözüm denemesi
+    params.time_limit.seconds = 20
+    params.solution_limit      = 100
 
     solution = routing.SolveWithParameters(params)
 
