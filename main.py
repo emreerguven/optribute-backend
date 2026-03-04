@@ -161,7 +161,7 @@ def optimize(request: OptimizationRequest):
     routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
 
     # 2. OTOMATİK DURAK FRENİ (Sonsuz kapasite durumunda şoförü korur)
-    max_stops = int((len(locations) / request.vehicle_count) * 2)
+    max_stops = int((len(locations) / request.vehicle_count) * 3)
     if max_stops < 15: 
         max_stops = len(locations) + 1 # Veri çok ufaksa limiti kaldır
 
