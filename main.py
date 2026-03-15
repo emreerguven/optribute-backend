@@ -309,6 +309,7 @@ def optimize(request: OptimizationRequest):
             })
 
         result_data = {"status": "success", "routes": routes_json}
-        result_data["map_html"] = generate_map_html(request.jobs, result_data)
+        # YENİ: Harita yerine tam teşekküllü Dashboard'u çağırıyoruz ve service_time gönderiyoruz
+        result_data["map_html"] = generate_dashboard_html(request.jobs, result_data, request.service_time)
         return result_data
     raise HTTPException(status_code=400, detail="Route not found!")
