@@ -93,7 +93,6 @@ def generate_dashboard_html(jobs, result_json, service_time):
         
         v_name = f"Vehicle {route['vehicle_id']}"
 
-        # WhatsApp Parçalama (Chunking) İşlemi
         wp_array = [f"{stop['lat']},{stop['lon']}" for stop in path]
         if len(wp_array) > 0:
             max_stops = 10 
@@ -277,7 +276,6 @@ def optimize(request: OptimizationRequest):
 
     routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
 
-    # Tavan Limitini (max_stops) Serbest Bıraktık
     max_stops = len(locations) + 1 
 
     def stop_count_callback(from_index):
@@ -308,15 +306,22 @@ def optimize(request: OptimizationRequest):
             time_dimension.CumulVar(index).SetMin(start_t)
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
-    # YENİ: Katı SetMin(2) Yerine Soft Lower Bound (Esnek Ceza)
+    # =========================================================================
+    # YENİ: İDEAL ARAÇ ZORLAMA VE DURAK DENGELEME ALGORİTMASI
+    # =========================================================================
     if request.optimization_goal == "vehicles":
+        # Sadece "Minimum Vehicles" modunda araçları eksiltmeye çalışır
         routing.SetFixedCostOfAllVehicles(100000)
     else:
         stop_dimension = routing.GetDimensionOrDie('StopCount')
         vehicles_to_force = min(request.vehicle_count, len(locations) - 1)
         for vehicle_id in range(vehicles_to_force):
-            # 100.000 ceza puanı ile sistemi aracı kullanmaya ikna ediyoruz (Çökmeyi engeller)
-            stop_dimension.SetCumulVarSoftLowerBound(routing.End(vehicle_id), 2, 100000)
+            # Ceza 10 Milyona (10.000 KM) çıkarıldı. Araç KESİNLİKLE kullanılacak!
+            stop_dimension.SetCumulVarSoftLowerBound(routing.End(vehicle_id), 2, 10000000)
+
+        # 1 araca 40 durak, diğerine 1 durak anomalisini engellemek için Elastik Denge.
+        # Durak farkı başına 10 KM ceza yazarak sistemi gizlice tatlı bir dengeye zorlar.
+        stop_dimension.SetGlobalSpanCostCoefficient(10000)
 
         if request.optimization_goal == "balance":
             time_dimension.SetGlobalSpanCostCoefficient(100)
