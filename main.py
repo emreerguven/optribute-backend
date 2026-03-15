@@ -306,26 +306,34 @@ def optimize(request: OptimizationRequest):
             time_dimension.CumulVar(index).SetMin(start_t)
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
+    # =========================================================================
+    # YENİ: DİNAMİK HEDEF VE CEZA ALGORİTMASI (SAF DISTANCE DÜZELTİLDİ)
+    # =========================================================================
     if request.optimization_goal == "vehicles":
         routing.SetFixedCostOfAllVehicles(100000)
     else:
         stop_dimension = routing.GetDimensionOrDie('StopCount')
         vehicles_to_force = min(request.vehicle_count, len(locations) - 1)
         for vehicle_id in range(vehicles_to_force):
+            # Aracı mecburen çıkar (Her araç en az 1 durak almalı)
             stop_dimension.SetCumulVarSoftLowerBound(routing.End(vehicle_id), 2, 10000000)
 
-        stop_dimension.SetGlobalSpanCostCoefficient(10000)
-
-        if request.optimization_goal == "balance":
+        if request.optimization_goal == "distance":
+            # SAF SHORTEST DISTANCE: Adalet umurumuzda değil, sadece km'yi kıs!
+            pass
+            
+        elif request.optimization_goal == "balance":
+            # Katı durak adaleti. Herkes eşit çalışsın.
+            stop_dimension.SetGlobalSpanCostCoefficient(10000)
             time_dimension.SetGlobalSpanCostCoefficient(100)
+            
         elif request.optimization_goal == "makespan":
+            # DURAK SAYISI UMRUMUZDA DEĞİL. Yeter ki saatler (Time) eşit ve erken bitsin!
             time_dimension.SetSpanCostCoefficientForAllVehicles(100)
-            time_dimension.SetGlobalSpanCostCoefficient(50)
+            time_dimension.SetGlobalSpanCostCoefficient(10000)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    # YENİ: Spagetti rotaları engelleyen bölgesel kümeleme (Clarke-Wright) algoritması
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.SAVINGS
-    # YENİ: Düğüm çözme ustası GLS (Guided Local Search)
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     search_parameters.time_limit.seconds = 35 
 
