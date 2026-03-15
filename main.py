@@ -61,32 +61,41 @@ def get_route_geometry(path_locations):
     except: pass
     return [], 0
 
-def generate_map_html(jobs, result_json):
-    if not result_json.get("routes"): return "<h1>No Route Found</h1>"
+def generate_dashboard_html(jobs, result_json, service_time):
+    if not result_json.get("routes"): return "<h1>Rota bulunamadı</h1>"
     center_lat, center_lon = jobs[0].lat, jobs[0].lon
     m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
-    colors = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue", "darkblue", "darkgreen", "cadetblue"]
+    colors = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue", "darkblue", "darkgreen"]
 
+    gantt_data = []
+    total_km = 0
+    total_load = 0
+    active_vehicles = 0
+
+    # 1. HARİTAYI VE GANTT VERİLERİNİ OLUŞTURMA
     for i, route in enumerate(result_json["routes"]):
         path = route["path"]
-        geometry = route.get("geometry", [])
-        color = colors[i % len(colors)]
-        total_load = route.get("total_load", 0) 
         if not path: continue
 
+        active_vehicles += 1
+        total_km += route["total_km"]
+        total_load += route.get("total_load", 0)
+
+        geometry = route.get("geometry", [])
+        color = colors[i % len(colors)]
+        v_name = f"Vehicle {route['vehicle_id']}"
+
         if geometry:
-            folium.PolyLine(
-                geometry, color=color, weight=4, opacity=0.8,
-                tooltip=f"Vehicle {route['vehicle_id']}: {route['total_km']} km | Load: {total_load} kg"
-            ).add_to(m)
+            folium.PolyLine(geometry, color=color, weight=4, opacity=0.8, tooltip=f"{v_name}: {route['total_km']} km").add_to(m)
 
         for stop in path:
             orj_id, lat, lon = stop["original_id"], stop["lat"], stop["lon"]
             order, demand, arrival = stop["order"], stop.get("demand", 0), stop.get("arrival_time", "")
 
+            # Harita İşaretçileri
             if orj_id == 0:
                 if order == 1:
-                    folium.Marker([lat, lon], popup="DEPOT (Start)", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
+                    folium.Marker([lat, lon], popup="DEPO", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
             else:
                 display_num = order - 1
                 folium.Marker(
@@ -96,9 +105,76 @@ def generate_map_html(jobs, result_json):
                         html=f'<div style="font-size: 11pt; font-weight: bold; color: {color}; background-color: white; border: 2px solid {color}; border-radius: 50%; width: 30px; height: 30px; text-align: center; line-height: 26px;">{display_num}</div>'
                     )
                 ).add_to(m)
-                folium.Marker([lat, lon], tooltip=f"Stop {display_num}: {demand} kg | ETA: {arrival}", opacity=0).add_to(m)
-    return m.get_root().render()
 
+            # Gantt Chart (Zaman Çizelgesi) İçin Veri Hazırlığı
+            if arrival:
+                h, m_minute = map(int, arrival.split(":"))
+                duration = service_time if orj_id != 0 else 5 # Depoda 5 dk, müşteride service_time
+                end_m = m_minute + duration
+                end_h = (h + (end_m // 60)) % 24
+                end_m = end_m % 60
+
+                stop_label = f"Durak {order - 1}" if orj_id != 0 else ("Depo Çıkış" if order == 1 else "Depo Dönüş")
+                gantt_data.append(f"[ '{v_name}', '{stop_label}', new Date(0,0,0, {h},{m_minute},0), new Date(0,0,0, {end_h},{end_m},0) ]")
+
+    gantt_rows_str = ",\n".join(gantt_data)
+    
+    # 2. FOLIUM HARİTASINI HTML'E ÇEVİR
+    base_html = m.get_root().render()
+
+    # 3. DASHBOARD TASARIMI (CSS, KPI KARTLARI VE GANTT CHART ENJEKSİYONU)
+    css_override = """
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        html, body { margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; font-family: 'Roboto', sans-serif; background-color: #f8f9fa;}
+        .folium-map { height: 100% !important; flex-grow: 1; z-index: 1;}
+    </style>
+    """
+    base_html = base_html.replace("</head>", css_override + "</head>")
+
+    # Üst Bölüm: Şık KPI Kartları
+    kpi_section = f"""
+    <div style="display:flex; justify-content:space-around; align-items:center; background:#1a73e8; color:white; padding:15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); z-index:9999; position:relative;">
+        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{round(total_km,1)} <span style="font-size:16px;font-weight:normal;">km</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Toplam Mesafe</div></div>
+        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{active_vehicles}</div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Aktif Araç</div></div>
+        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{total_load} <span style="font-size:16px;font-weight:normal;">kg</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Toplam Yük</div></div>
+    </div>
+    """
+    base_html = base_html.replace("<body>", "<body>" + kpi_section)
+
+    # Alt Bölüm: Google Charts Timeline (Gantt)
+    timeline_section = f"""
+    <div id="timeline_container" style="height: 35vh; width: 100%; position: relative; z-index:9999; background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; box-shadow: 0 -2px 10px rgba(0,0,0,0.05);">
+        <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:10px;">⏱️ Araç Mesai Çizelgesi (Timeline)</div>
+        <div id="timeline" style="height: calc(100% - 25px); width: 100%;"></div>
+    </div>
+    <script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
+    <script type="text/javascript">
+      google.charts.load('current', {{'packages':['timeline']}});
+      google.charts.setOnLoadCallback(drawChart);
+      function drawChart() {{
+        var container = document.getElementById('timeline');
+        var chart = new google.visualization.Timeline(container);
+        var dataTable = new google.visualization.DataTable();
+        dataTable.addColumn({{ type: 'string', id: 'Araç' }});
+        dataTable.addColumn({{ type: 'string', id: 'Durak' }});
+        dataTable.addColumn({{ type: 'date', id: 'Başlangıç' }});
+        dataTable.addColumn({{ type: 'date', id: 'Bitiş' }});
+        dataTable.addRows([
+          {gantt_rows_str}
+        ]);
+        var options = {{
+            timeline: {{ colorByRowLabel: true, showRowLabels: true }},
+            backgroundColor: '#ffffff',
+            hAxis: {{ format: 'HH:mm' }}
+        }};
+        chart.draw(dataTable, options);
+      }}
+    </script>
+    """
+    base_html = base_html.replace("</body>", timeline_section + "</body>")
+
+    return base_html
 @app.post("/preview")
 def preview_map(request: PreviewRequest):
     locations = request.jobs
