@@ -26,6 +26,7 @@ class OptimizationRequest(BaseModel):
     open_path: bool = False
     service_time: int = 10        
     route_start_time: int = 480   
+    optimization_goal: str = "distance" 
 
 class PreviewRequest(BaseModel):
     jobs: List[Job]
@@ -62,17 +63,18 @@ def get_route_geometry(path_locations):
     return [], 0
 
 def generate_dashboard_html(jobs, result_json, service_time):
-    if not result_json.get("routes"): return "<h1>Rota bulunamadı</h1>"
+    if not result_json.get("routes"): return "<h1>No Route Found</h1>"
     center_lat, center_lon = jobs[0].lat, jobs[0].lon
     m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
-    colors = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue", "darkblue", "darkgreen"]
+    
+    hex_colors = ["#d50000", "#2962ff", "#00c853", "#aa00ff", "#ff6d00", "#00bfa5", "#ffd600", "#c51162", "#aeea00", "#00b8d4"]
 
     gantt_data = []
     total_km = 0
     total_load = 0
     active_vehicles = 0
+    active_vehicle_colors = []
 
-    # 1. HARİTAYI VE GANTT VERİLERİNİ OLUŞTURMA
     for i, route in enumerate(result_json["routes"]):
         path = route["path"]
         if not path: continue
@@ -82,7 +84,10 @@ def generate_dashboard_html(jobs, result_json, service_time):
         total_load += route.get("total_load", 0)
 
         geometry = route.get("geometry", [])
-        color = colors[i % len(colors)]
+        
+        color = hex_colors[(active_vehicles - 1) % len(hex_colors)]
+        active_vehicle_colors.append(color)
+        
         v_name = f"Vehicle {route['vehicle_id']}"
 
         if geometry:
@@ -92,10 +97,9 @@ def generate_dashboard_html(jobs, result_json, service_time):
             orj_id, lat, lon = stop["original_id"], stop["lat"], stop["lon"]
             order, demand, arrival = stop["order"], stop.get("demand", 0), stop.get("arrival_time", "")
 
-            # Harita İşaretçileri
             if orj_id == 0:
                 if order == 1:
-                    folium.Marker([lat, lon], popup="DEPO", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
+                    folium.Marker([lat, lon], popup="DEPOT", icon=folium.Icon(color="black", icon="home", prefix="fa")).add_to(m)
             else:
                 display_num = order - 1
                 folium.Marker(
@@ -106,23 +110,21 @@ def generate_dashboard_html(jobs, result_json, service_time):
                     )
                 ).add_to(m)
 
-            # Gantt Chart (Zaman Çizelgesi) İçin Veri Hazırlığı
             if arrival:
                 h, m_minute = map(int, arrival.split(":"))
-                duration = service_time if orj_id != 0 else 5 # Depoda 5 dk, müşteride service_time
+                duration = service_time if orj_id != 0 else 5 
                 end_m = m_minute + duration
                 end_h = (h + (end_m // 60)) % 24
                 end_m = end_m % 60
 
-                stop_label = f"Durak {order - 1}" if orj_id != 0 else ("Depo Çıkış" if order == 1 else "Depo Dönüş")
+                stop_label = f"Stop {order - 1}" if orj_id != 0 else ("Depot Departure" if order == 1 else "Depot Return")
                 gantt_data.append(f"[ '{v_name}', '{stop_label}', new Date(0,0,0, {h},{m_minute},0), new Date(0,0,0, {end_h},{end_m},0) ]")
 
     gantt_rows_str = ",\n".join(gantt_data)
+    js_colors_array = "[" + ",".join([f"'{c}'" for c in active_vehicle_colors]) + "]"
     
-    # 2. FOLIUM HARİTASINI HTML'E ÇEVİR
     base_html = m.get_root().render()
 
-    # 3. DASHBOARD TASARIMI (CSS, KPI KARTLARI VE GANTT CHART ENJEKSİYONU)
     css_override = """
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
@@ -132,20 +134,18 @@ def generate_dashboard_html(jobs, result_json, service_time):
     """
     base_html = base_html.replace("</head>", css_override + "</head>")
 
-    # Üst Bölüm: Şık KPI Kartları
     kpi_section = f"""
     <div style="display:flex; justify-content:space-around; align-items:center; background:#1a73e8; color:white; padding:15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); z-index:9999; position:relative;">
-        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{round(total_km,1)} <span style="font-size:16px;font-weight:normal;">km</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Toplam Mesafe</div></div>
-        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{active_vehicles}</div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Aktif Araç</div></div>
-        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{total_load} <span style="font-size:16px;font-weight:normal;">kg</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Toplam Yük</div></div>
+        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{round(total_km,1)} <span style="font-size:16px;font-weight:normal;">km</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Total Distance</div></div>
+        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{active_vehicles}</div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Active Vehicles</div></div>
+        <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{total_load} <span style="font-size:16px;font-weight:normal;">kg</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Total Load</div></div>
     </div>
     """
     base_html = base_html.replace("<body>", "<body>" + kpi_section)
 
-    # Alt Bölüm: Google Charts Timeline (Gantt)
     timeline_section = f"""
     <div id="timeline_container" style="height: 35vh; width: 100%; position: relative; z-index:9999; background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; box-shadow: 0 -2px 10px rgba(0,0,0,0.05);">
-        <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:10px;">⏱️ Araç Mesai Çizelgesi (Timeline)</div>
+        <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:10px;">⏱️ Vehicle Shift Timeline</div>
         <div id="timeline" style="height: calc(100% - 25px); width: 100%;"></div>
     </div>
     <script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
@@ -156,17 +156,18 @@ def generate_dashboard_html(jobs, result_json, service_time):
         var container = document.getElementById('timeline');
         var chart = new google.visualization.Timeline(container);
         var dataTable = new google.visualization.DataTable();
-        dataTable.addColumn({{ type: 'string', id: 'Araç' }});
-        dataTable.addColumn({{ type: 'string', id: 'Durak' }});
-        dataTable.addColumn({{ type: 'date', id: 'Başlangıç' }});
-        dataTable.addColumn({{ type: 'date', id: 'Bitiş' }});
+        dataTable.addColumn({{ type: 'string', id: 'Vehicle' }});
+        dataTable.addColumn({{ type: 'string', id: 'Stop' }});
+        dataTable.addColumn({{ type: 'date', id: 'Start' }});
+        dataTable.addColumn({{ type: 'date', id: 'End' }});
         dataTable.addRows([
           {gantt_rows_str}
         ]);
         var options = {{
             timeline: {{ colorByRowLabel: true, showRowLabels: true }},
             backgroundColor: '#ffffff',
-            hAxis: {{ format: 'HH:mm' }}
+            hAxis: {{ format: 'HH:mm' }},
+            colors: {js_colors_array} 
         }};
         chart.draw(dataTable, options);
       }}
@@ -175,6 +176,7 @@ def generate_dashboard_html(jobs, result_json, service_time):
     base_html = base_html.replace("</body>", timeline_section + "</body>")
 
     return base_html
+
 @app.post("/preview")
 def preview_map(request: PreviewRequest):
     locations = request.jobs
@@ -264,6 +266,15 @@ def optimize(request: OptimizationRequest):
             time_dimension.CumulVar(index).SetMin(start_t)
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
+    # OTONOM OPTİMİZASYON SEÇİMİ (Makespan eklendi)
+    if request.optimization_goal == "vehicles":
+        routing.SetFixedCostOfAllVehicles(100000)
+    elif request.optimization_goal == "balance":
+        time_dimension.SetGlobalSpanCostCoefficient(100)
+    elif request.optimization_goal == "makespan":
+        time_dimension.SetSpanCostCoefficientForAllVehicles(100)
+        time_dimension.SetGlobalSpanCostCoefficient(50)
+
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.TABU_SEARCH
@@ -309,7 +320,6 @@ def optimize(request: OptimizationRequest):
             })
 
         result_data = {"status": "success", "routes": routes_json}
-        # YENİ: Harita yerine tam teşekküllü Dashboard'u çağırıyoruz ve service_time gönderiyoruz
         result_data["map_html"] = generate_dashboard_html(request.jobs, result_data, request.service_time)
         return result_data
     raise HTTPException(status_code=400, detail="Route not found!")
