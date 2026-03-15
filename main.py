@@ -93,21 +93,37 @@ def generate_dashboard_html(jobs, result_json, service_time):
         
         v_name = f"Vehicle {route['vehicle_id']}"
 
-        # WhatsApp Butonları
+        # =========================================================
+        # YENİ: Google Maps 10 Durak Kırpılma Çözümü (Bucket/Chunking)
+        # =========================================================
         wp_array = [f"{stop['lat']},{stop['lon']}" for stop in path]
         if len(wp_array) > 0:
-            origin = wp_array[0]
-            destination = wp_array[-1]
-            waypoints = ""
-            if len(wp_array) > 2:
-                waypoints = "&waypoints=" + "%7C".join(wp_array[1:-1])
+            max_stops = 10 # Google Maps güvenli limit (Başlangıç ve Bitiş dahil)
+            chunks = []
             
-            maps_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}{waypoints}"
-            msg = f"🚚 {v_name} Route is Ready!\nTotal: {route['total_km']} km | Load: {current_route_load} kg\n\nStart Navigation:\n{maps_url}"
-            wa_link = f"https://wa.me/?text={urllib.parse.quote(msg)}"
+            if len(wp_array) <= max_stops:
+                chunks.append(wp_array)
+            else:
+                # Rotayı 10'arlı parçalara böl, son durak bir sonraki parçanın ilk durağı olsun
+                for j in range(0, len(wp_array) - 1, max_stops - 1):
+                    chunks.append(wp_array[j:j + max_stops])
             
-            btn_html = f"<a href='{wa_link}' target='_blank' style='background-color: {color}; color: white; text-decoration: none; padding: 10px 20px; border-radius: 6px; font-size: 13px; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.15); display: inline-flex; align-items: center; justify-content: center;'>{v_name} 📲 Send</a>"
-            wa_buttons.append(btn_html)
+            for idx, chunk in enumerate(chunks):
+                origin = chunk[0]
+                destination = chunk[-1]
+                waypoints = ""
+                if len(chunk) > 2:
+                    waypoints = "&waypoints=" + "%7C".join(chunk[1:-1])
+                
+                # Resmi Google Maps Directions API formatı
+                maps_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}{waypoints}&travelmode=driving"
+                
+                part_text = f" (Part {idx + 1})" if len(chunks) > 1 else ""
+                msg = f"🚚 {v_name}{part_text} Route is Ready!\n\nStart Navigation:\n{maps_url}"
+                wa_link = f"https://wa.me/?text={urllib.parse.quote(msg)}"
+                
+                btn_html = f"<a href='{wa_link}' target='_blank' style='background-color: {color}; color: white; text-decoration: none; padding: 10px 15px; border-radius: 6px; font-size: 13px; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.15); display: inline-flex; align-items: center; justify-content: center;'>{v_name}{part_text} 📲</a>"
+                wa_buttons.append(btn_html)
 
         if geometry:
             folium.PolyLine(geometry, color=color, weight=4, opacity=0.8, tooltip=f"{v_name}: {route['total_km']} km").add_to(m)
@@ -142,19 +158,23 @@ def generate_dashboard_html(jobs, result_json, service_time):
     gantt_rows_str = ",\n".join(gantt_data)
     js_colors_array = "[" + ",".join([f"'{c}'" for c in active_vehicle_colors]) + "]"
     
+    # Dinamik Gantt Chart Yüksekliği (Araç başına 45px + boşluk payı)
+    timeline_height = max(250, active_vehicles * 45 + 80)
+    
     base_html = m.get_root().render()
 
+    # YENİ: CSS Scroll Düzenlemesi (overflow-y: auto)
     css_override = """
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
-        html, body { margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; font-family: 'Roboto', sans-serif; background-color: #f8f9fa;}
-        .folium-map { height: 100% !important; flex-grow: 1; z-index: 1;}
+        html, body { margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; overflow-y: auto; overflow-x: hidden; font-family: 'Roboto', sans-serif; background-color: #f8f9fa;}
+        .folium-map { min-height: 50vh; flex-grow: 1; z-index: 1;}
     </style>
     """
     base_html = base_html.replace("</head>", css_override + "</head>")
 
     kpi_section = f"""
-    <div style="display:flex; justify-content:space-around; align-items:center; background:#1a73e8; color:white; padding:15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); z-index:9999; position:relative;">
+    <div style="display:flex; justify-content:space-around; align-items:center; background:#1a73e8; color:white; padding:15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); z-index:9999; position:relative; flex-shrink: 0;">
         <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{round(total_km,1)} <span style="font-size:16px;font-weight:normal;">km</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Total Distance</div></div>
         <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{active_vehicles}</div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Active Vehicles</div></div>
         <div style="text-align:center;"><div style="font-size:26px; font-weight:bold;">{total_load} <span style="font-size:16px;font-weight:normal;">kg</span></div><div style="font-size:12px; opacity:0.8; text-transform:uppercase; letter-spacing:1px;">Total Load</div></div>
@@ -163,19 +183,20 @@ def generate_dashboard_html(jobs, result_json, service_time):
     base_html = base_html.replace("<body>", "<body>" + kpi_section)
 
     wa_buttons_html = f"""
-    <div style="background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; z-index:9999; position:relative; box-shadow: 0 -2px 10px rgba(0,0,0,0.05);">
+    <div style="background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; z-index:9999; position:relative; flex-shrink: 0;">
         <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:10px;">📲 Send Routes to Drivers (WhatsApp)</div>
-        <div style="display: flex; flex-wrap: wrap; gap: 10px;">
+        <div style="display: flex; flex-wrap: wrap; gap: 8px;">
             {" ".join(wa_buttons)}
         </div>
     </div>
     """
 
+    # YENİ: Timeline kapsayıcısı artık dinamik boyutta ve sayfa scroll olabiliyor
     timeline_section = f"""
     {wa_buttons_html}
-    <div id="timeline_container" style="height: 35vh; width: 100%; position: relative; z-index:9999; background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; box-shadow: 0 -2px 10px rgba(0,0,0,0.05);">
+    <div id="timeline_container" style="min-height: {timeline_height + 40}px; width: 100%; position: relative; z-index:9999; background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; box-shadow: 0 -2px 10px rgba(0,0,0,0.05); flex-shrink: 0;">
         <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:10px;">⏱️ Vehicle Shift Timeline</div>
-        <div id="timeline" style="height: calc(100% - 25px); width: 100%;"></div>
+        <div id="timeline" style="height: {timeline_height}px; width: 100%;"></div>
     </div>
     <script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
     <script type="text/javascript">
@@ -263,9 +284,9 @@ def optimize(request: OptimizationRequest):
 
     routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
 
-    max_stops = int((len(locations) / request.vehicle_count) * 2)
-    if max_stops < 15: 
-        max_stops = len(locations) + 1 
+    # Tavanı kaldırdık. İsteyen araç istediği kadar durak alabilir.
+    # Dengelemeyi artık katı duvarlarla değil, "Balance" hedefiyle yapacağız.
+    max_stops = len(locations) + 1
 
     def stop_count_callback(from_index):
         return 1
@@ -295,19 +316,12 @@ def optimize(request: OptimizationRequest):
             time_dimension.CumulVar(index).SetMin(start_t)
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
-    # =========================================================
-    # YENİ: OTONOM OPTİMİZASYON SEÇİMİ VE ARAÇ ZORLAMA KURALI
-    # =========================================================
     if request.optimization_goal == "vehicles":
-        # Sadece "Minimum Vehicles" modunda araçları eksiltmeye çalışır
         routing.SetFixedCostOfAllVehicles(100000)
     else:
-        # Diğer tüm modlarda (Distance, Balance, Makespan), 
-        # girilen araç sayısını korumayı (her araca en az 1 durak vermeyi) zorunlu tutar.
         stop_dimension = routing.GetDimensionOrDie('StopCount')
         vehicles_to_force = min(request.vehicle_count, len(locations) - 1)
         for vehicle_id in range(vehicles_to_force):
-            # Depo Çıkış(1) + Durak(1) = Min 2 değerini zorla, boş aracı yasakla!
             stop_dimension.CumulVar(routing.End(vehicle_id)).SetMin(2)
 
         if request.optimization_goal == "balance":
