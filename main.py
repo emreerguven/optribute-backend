@@ -4,6 +4,7 @@ from typing import List
 from folium.features import DivIcon
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
+import urllib.parse
 import requests
 import folium
 import polyline
@@ -74,6 +75,7 @@ def generate_dashboard_html(jobs, result_json, service_time):
     total_load = 0
     active_vehicles = 0
     active_vehicle_colors = []
+    wa_buttons = []
 
     for i, route in enumerate(result_json["routes"]):
         path = route["path"]
@@ -81,7 +83,8 @@ def generate_dashboard_html(jobs, result_json, service_time):
 
         active_vehicles += 1
         total_km += route["total_km"]
-        total_load += route.get("total_load", 0)
+        current_route_load = route.get("total_load", 0)
+        total_load += current_route_load
 
         geometry = route.get("geometry", [])
         
@@ -89,6 +92,22 @@ def generate_dashboard_html(jobs, result_json, service_time):
         active_vehicle_colors.append(color)
         
         v_name = f"Vehicle {route['vehicle_id']}"
+
+        # WhatsApp Butonları
+        wp_array = [f"{stop['lat']},{stop['lon']}" for stop in path]
+        if len(wp_array) > 0:
+            origin = wp_array[0]
+            destination = wp_array[-1]
+            waypoints = ""
+            if len(wp_array) > 2:
+                waypoints = "&waypoints=" + "%7C".join(wp_array[1:-1])
+            
+            maps_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}{waypoints}"
+            msg = f"🚚 {v_name} Route is Ready!\nTotal: {route['total_km']} km | Load: {current_route_load} kg\n\nStart Navigation:\n{maps_url}"
+            wa_link = f"https://wa.me/?text={urllib.parse.quote(msg)}"
+            
+            btn_html = f"<a href='{wa_link}' target='_blank' style='background-color: {color}; color: white; text-decoration: none; padding: 10px 20px; border-radius: 6px; font-size: 13px; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.15); display: inline-flex; align-items: center; justify-content: center;'>{v_name} 📲 Send</a>"
+            wa_buttons.append(btn_html)
 
         if geometry:
             folium.PolyLine(geometry, color=color, weight=4, opacity=0.8, tooltip=f"{v_name}: {route['total_km']} km").add_to(m)
@@ -143,7 +162,17 @@ def generate_dashboard_html(jobs, result_json, service_time):
     """
     base_html = base_html.replace("<body>", "<body>" + kpi_section)
 
+    wa_buttons_html = f"""
+    <div style="background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; z-index:9999; position:relative; box-shadow: 0 -2px 10px rgba(0,0,0,0.05);">
+        <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:10px;">📲 Send Routes to Drivers (WhatsApp)</div>
+        <div style="display: flex; flex-wrap: wrap; gap: 10px;">
+            {" ".join(wa_buttons)}
+        </div>
+    </div>
+    """
+
     timeline_section = f"""
+    {wa_buttons_html}
     <div id="timeline_container" style="height: 35vh; width: 100%; position: relative; z-index:9999; background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; box-shadow: 0 -2px 10px rgba(0,0,0,0.05);">
         <div style="font-size:14px; font-weight:bold; color:#555; margin-bottom:10px;">⏱️ Vehicle Shift Timeline</div>
         <div id="timeline" style="height: calc(100% - 25px); width: 100%;"></div>
@@ -266,14 +295,26 @@ def optimize(request: OptimizationRequest):
             time_dimension.CumulVar(index).SetMin(start_t)
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
-    # OTONOM OPTİMİZASYON SEÇİMİ (Makespan eklendi)
+    # =========================================================
+    # YENİ: OTONOM OPTİMİZASYON SEÇİMİ VE ARAÇ ZORLAMA KURALI
+    # =========================================================
     if request.optimization_goal == "vehicles":
+        # Sadece "Minimum Vehicles" modunda araçları eksiltmeye çalışır
         routing.SetFixedCostOfAllVehicles(100000)
-    elif request.optimization_goal == "balance":
-        time_dimension.SetGlobalSpanCostCoefficient(100)
-    elif request.optimization_goal == "makespan":
-        time_dimension.SetSpanCostCoefficientForAllVehicles(100)
-        time_dimension.SetGlobalSpanCostCoefficient(50)
+    else:
+        # Diğer tüm modlarda (Distance, Balance, Makespan), 
+        # girilen araç sayısını korumayı (her araca en az 1 durak vermeyi) zorunlu tutar.
+        stop_dimension = routing.GetDimensionOrDie('StopCount')
+        vehicles_to_force = min(request.vehicle_count, len(locations) - 1)
+        for vehicle_id in range(vehicles_to_force):
+            # Depo Çıkış(1) + Durak(1) = Min 2 değerini zorla, boş aracı yasakla!
+            stop_dimension.CumulVar(routing.End(vehicle_id)).SetMin(2)
+
+        if request.optimization_goal == "balance":
+            time_dimension.SetGlobalSpanCostCoefficient(100)
+        elif request.optimization_goal == "makespan":
+            time_dimension.SetSpanCostCoefficientForAllVehicles(100)
+            time_dimension.SetGlobalSpanCostCoefficient(50)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
