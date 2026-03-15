@@ -306,21 +306,14 @@ def optimize(request: OptimizationRequest):
             time_dimension.CumulVar(index).SetMin(start_t)
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
-    # =========================================================================
-    # YENİ: İDEAL ARAÇ ZORLAMA VE DURAK DENGELEME ALGORİTMASI
-    # =========================================================================
     if request.optimization_goal == "vehicles":
-        # Sadece "Minimum Vehicles" modunda araçları eksiltmeye çalışır
         routing.SetFixedCostOfAllVehicles(100000)
     else:
         stop_dimension = routing.GetDimensionOrDie('StopCount')
         vehicles_to_force = min(request.vehicle_count, len(locations) - 1)
         for vehicle_id in range(vehicles_to_force):
-            # Ceza 10 Milyona (10.000 KM) çıkarıldı. Araç KESİNLİKLE kullanılacak!
             stop_dimension.SetCumulVarSoftLowerBound(routing.End(vehicle_id), 2, 10000000)
 
-        # 1 araca 40 durak, diğerine 1 durak anomalisini engellemek için Elastik Denge.
-        # Durak farkı başına 10 KM ceza yazarak sistemi gizlice tatlı bir dengeye zorlar.
         stop_dimension.SetGlobalSpanCostCoefficient(10000)
 
         if request.optimization_goal == "balance":
@@ -330,8 +323,10 @@ def optimize(request: OptimizationRequest):
             time_dimension.SetGlobalSpanCostCoefficient(50)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.TABU_SEARCH
+    # YENİ: Spagetti rotaları engelleyen bölgesel kümeleme (Clarke-Wright) algoritması
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.SAVINGS
+    # YENİ: Düğüm çözme ustası GLS (Guided Local Search)
+    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     search_parameters.time_limit.seconds = 35 
 
     solution = routing.SolveWithParameters(search_parameters)
