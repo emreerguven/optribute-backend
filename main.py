@@ -93,18 +93,15 @@ def generate_dashboard_html(jobs, result_json, service_time):
         
         v_name = f"Vehicle {route['vehicle_id']}"
 
-        # =========================================================
-        # YENİ: Google Maps 10 Durak Kırpılma Çözümü (Bucket/Chunking)
-        # =========================================================
+        # WhatsApp Parçalama (Chunking) İşlemi
         wp_array = [f"{stop['lat']},{stop['lon']}" for stop in path]
         if len(wp_array) > 0:
-            max_stops = 10 # Google Maps güvenli limit (Başlangıç ve Bitiş dahil)
+            max_stops = 10 
             chunks = []
             
             if len(wp_array) <= max_stops:
                 chunks.append(wp_array)
             else:
-                # Rotayı 10'arlı parçalara böl, son durak bir sonraki parçanın ilk durağı olsun
                 for j in range(0, len(wp_array) - 1, max_stops - 1):
                     chunks.append(wp_array[j:j + max_stops])
             
@@ -115,7 +112,6 @@ def generate_dashboard_html(jobs, result_json, service_time):
                 if len(chunk) > 2:
                     waypoints = "&waypoints=" + "%7C".join(chunk[1:-1])
                 
-                # Resmi Google Maps Directions API formatı
                 maps_url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}{waypoints}&travelmode=driving"
                 
                 part_text = f" (Part {idx + 1})" if len(chunks) > 1 else ""
@@ -158,12 +154,10 @@ def generate_dashboard_html(jobs, result_json, service_time):
     gantt_rows_str = ",\n".join(gantt_data)
     js_colors_array = "[" + ",".join([f"'{c}'" for c in active_vehicle_colors]) + "]"
     
-    # Dinamik Gantt Chart Yüksekliği (Araç başına 45px + boşluk payı)
     timeline_height = max(250, active_vehicles * 45 + 80)
     
     base_html = m.get_root().render()
 
-    # YENİ: CSS Scroll Düzenlemesi (overflow-y: auto)
     css_override = """
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
@@ -191,7 +185,6 @@ def generate_dashboard_html(jobs, result_json, service_time):
     </div>
     """
 
-    # YENİ: Timeline kapsayıcısı artık dinamik boyutta ve sayfa scroll olabiliyor
     timeline_section = f"""
     {wa_buttons_html}
     <div id="timeline_container" style="min-height: {timeline_height + 40}px; width: 100%; position: relative; z-index:9999; background: white; padding: 15px; box-sizing: border-box; border-top: 1px solid #ddd; box-shadow: 0 -2px 10px rgba(0,0,0,0.05); flex-shrink: 0;">
@@ -284,9 +277,8 @@ def optimize(request: OptimizationRequest):
 
     routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, [actual_capacity] * request.vehicle_count, True, "Capacity")
 
-    # Tavanı kaldırdık. İsteyen araç istediği kadar durak alabilir.
-    # Dengelemeyi artık katı duvarlarla değil, "Balance" hedefiyle yapacağız.
-    max_stops = len(locations) + 1
+    # Tavan Limitini (max_stops) Serbest Bıraktık
+    max_stops = len(locations) + 1 
 
     def stop_count_callback(from_index):
         return 1
@@ -316,13 +308,15 @@ def optimize(request: OptimizationRequest):
             time_dimension.CumulVar(index).SetMin(start_t)
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
+    # YENİ: Katı SetMin(2) Yerine Soft Lower Bound (Esnek Ceza)
     if request.optimization_goal == "vehicles":
         routing.SetFixedCostOfAllVehicles(100000)
     else:
         stop_dimension = routing.GetDimensionOrDie('StopCount')
         vehicles_to_force = min(request.vehicle_count, len(locations) - 1)
         for vehicle_id in range(vehicles_to_force):
-            stop_dimension.CumulVar(routing.End(vehicle_id)).SetMin(2)
+            # 100.000 ceza puanı ile sistemi aracı kullanmaya ikna ediyoruz (Çökmeyi engeller)
+            stop_dimension.SetCumulVarSoftLowerBound(routing.End(vehicle_id), 2, 100000)
 
         if request.optimization_goal == "balance":
             time_dimension.SetGlobalSpanCostCoefficient(100)
