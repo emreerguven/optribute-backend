@@ -378,3 +378,6 @@ def optimize(request: OptimizationRequest):
         result_data["map_html"] = generate_dashboard_html(request.jobs, result_data, request.service_time)
         return result_data
     raise HTTPException(status_code=400, detail="Route not found!")
+
+from main_v2 import app as app_v2
+app.mount("/v2", app_v2)
