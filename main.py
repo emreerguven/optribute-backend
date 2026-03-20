@@ -307,7 +307,7 @@ def optimize(request: OptimizationRequest):
             time_dimension.SetCumulVarSoftUpperBound(index, end_t, 100)
 
     # =========================================================================
-    # YENİ: DİNAMİK HEDEF VE CEZA ALGORİTMASI (SAF DISTANCE DÜZELTİLDİ)
+    # YENİ: BİRİM SENKRONİZASYONU (Mesafe ve Zaman Katsayıları Kalibre Edildi)
     # =========================================================================
     if request.optimization_goal == "vehicles":
         routing.SetFixedCostOfAllVehicles(100000)
@@ -315,22 +315,20 @@ def optimize(request: OptimizationRequest):
         stop_dimension = routing.GetDimensionOrDie('StopCount')
         vehicles_to_force = min(request.vehicle_count, len(locations) - 1)
         for vehicle_id in range(vehicles_to_force):
-            # Aracı mecburen çıkar (Her araç en az 1 durak almalı)
             stop_dimension.SetCumulVarSoftLowerBound(routing.End(vehicle_id), 2, 10000000)
 
         if request.optimization_goal == "distance":
-            # SAF SHORTEST DISTANCE: Adalet umurumuzda değil, sadece km'yi kıs!
             pass
             
         elif request.optimization_goal == "balance":
-            # Katı durak adaleti. Herkes eşit çalışsın.
-            stop_dimension.SetGlobalSpanCostCoefficient(10000)
-            time_dimension.SetGlobalSpanCostCoefficient(100)
+            # 1 durak adaletsizliği = 50 KM ceza (Güçlü Durak Kümelemesi)
+            stop_dimension.SetGlobalSpanCostCoefficient(50000)
             
         elif request.optimization_goal == "makespan":
-            # DURAK SAYISI UMRUMUZDA DEĞİL. Yeter ki saatler (Time) eşit ve erken bitsin!
-            time_dimension.SetSpanCostCoefficientForAllVehicles(100)
-            time_dimension.SetGlobalSpanCostCoefficient(10000)
+            # 1 dakika uzama = 500 Metre Ceza (Sıkı zaman optimizasyonu)
+            time_dimension.SetSpanCostCoefficientForAllVehicles(500)
+            # 1 dakika bitiş saati farkı = 1.5 KM Ceza (Kümelemeyi bozmayan esnek adalet)
+            time_dimension.SetGlobalSpanCostCoefficient(1500)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.SAVINGS
