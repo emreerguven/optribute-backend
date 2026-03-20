@@ -5,3 +5,4 @@ requests
 folium
 polyline
 pydantic
+hygese==0.0.2
