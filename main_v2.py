@@ -682,7 +682,7 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
 # API ENDPOINT'LERİ
 # =============================================================================
 
-@app.post("/v2/preview")
+@app.post("/preview")
 def preview_map(request: PreviewRequest):
     """Lokasyonları haritada önizle (v1 ile aynı)."""
     if not request.jobs:
@@ -707,7 +707,7 @@ def preview_map(request: PreviewRequest):
     return {"status": "success", "map_html": m.get_root().render()}
 
 
-@app.post("/v2/optimize")
+@app.post("/optimize")
 def optimize_v2(request: OptimizationRequest):
     """
     v2 Ana optimizasyon endpoint'i.
@@ -785,7 +785,7 @@ def optimize_v2(request: OptimizationRequest):
     return result
 
 
-@app.get("/v2/health")
+@app.get("/health")
 def health():
     return {
         "status": "ok",
