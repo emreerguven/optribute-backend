@@ -739,7 +739,7 @@ def optimize_v2(request: OptimizationRequest):
         locations, dist_matrix, dur_matrix, request
     )
 
-    ortools_time = max(15, 40 - int(time.time() - t_start))
+    ortools_time = 35
     solution = solve_with_ortools(
         routing, manager, time_dim, locations, request,
         hgs_routes=hgs_routes,
