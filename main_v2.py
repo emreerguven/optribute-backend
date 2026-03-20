@@ -347,39 +347,26 @@ def solve_with_ortools(
     routing,
     manager,
     time_dim,
-    locations: List[Dict],
-    request: OptimizationRequest,
-    hgs_routes: Optional[List[List[int]]] = None,
-    time_limit: int = 30
-) -> Any:
-    """
-    OR-Tools'u çalıştırır.
-    HGS çözümü varsa hint olarak verir → daha hızlı iyi sonuç.
-    """
+    locations,
+    request,
+    hgs_routes=None,
+    time_limit=35
+):
     search_params = pywrapcp.DefaultRoutingSearchParameters()
 
-    if hgs_routes:
-        # HGS hint varsa: ALNS + daha az ilk çözüm arama süresi
-        hint = hgs_routes_to_ortools_hint(routing, manager, hgs_routes)
-        if hint:
-            search_params.first_solution_strategy = (
-                routing_enums_pb2.FirstSolutionStrategy.FIRST_UNBOUND_MIN_VALUE
-            )
-            logger.info("HGS hint OR-Tools'a aktarıldı")
-        else:
-            search_params.first_solution_strategy = (
-                routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-            )
-    else:
-        # HGS yoksa: SAVINGS iyi bir fallback
-        search_params.first_solution_strategy = (
-            routing_enums_pb2.FirstSolutionStrategy.SAVINGS
-        )
-
+    # Hint aktarımı güvenilmez olduğu için şimdilik SAVINGS kullan.
+    # HGS'i Hafta 2'de ALNS warm-start olarak entegre edeceğiz.
+    search_params.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.SAVINGS
+    )
     search_params.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
     search_params.time_limit.seconds = time_limit
+
+    if hgs_routes:
+        logger.info(f"HGS {len(hgs_routes)} rota üretti — "
+                    f"Hafta 2'de ALNS warm-start olarak kullanılacak")
 
     t0 = time.time()
     solution = routing.SolveWithParameters(search_params)
