@@ -1,22 +1,14 @@
 """
 Optribute v2 — HGS + OR-Tools VRPTW
 ------------------------------------
-Katman 1: OSRM  → gerçek yol matrisleri
-Katman 2: HGS   → başlangıç çözümü (PyHygese) — Hafta 2'de ALNS warm-start olarak kullanılacak
-Katman 3: OR-Tools → VRPTW, tüm bug'lar fix edildi
-
-Fix listesi:
-- Araç başlangıç saati: SetValue → SetMin+SetMax (garanti çalışır)
-- Job time window: route_start_time'dan önceye izin verilmiyor
-- Time window penalty: 1000 → 50000 (ihlaller gerçekten cezalandırılıyor)
+Fix listesi (tüm sürümler dahil):
+- Araç başlangıç saati: SetValue → SetMin+SetMax
+- Time window penalty: 1000 → 50000
 - vehicles modu: dynamic fixed cost
-- balance/makespan katsayıları: birim normalize edildi
-- makespan modunda arc cost = time (v1'de hep distance'tı)
+- makespan modunda arc cost = time
 - vehicles_to_force: imkânsız constraint kaldırıldı
-- solve süresi: her zaman tam 35 saniye
-
-Kurulum:
-    pip install fastapi uvicorn pydantic requests folium polyline hygese ortools
+- [YENİ] Gantt midnight overflow: gece yarısını geçen saatler artık doğru gösteriliyor
+- [YENİ] Time window conflict: route_start_time > job time_end çelişkisi giderildi
 """
 
 from fastapi import FastAPI, HTTPException
@@ -191,13 +183,11 @@ def build_ortools_model(locations, dist_matrix, dur_matrix, request: Optimizatio
     time_cb_idx = routing.RegisterTransitCallback(time_callback)
     demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_callback)
 
-    # makespan modunda arc cost = zaman
     if request.optimization_goal == "makespan":
         routing.SetArcCostEvaluatorOfAllVehicles(time_cb_idx)
     else:
         routing.SetArcCostEvaluatorOfAllVehicles(dist_cb_idx)
 
-    # Kapasite
     actual_capacity = request.vehicle_capacity if request.use_capacity else 9_999_999
     routing.AddDimensionWithVehicleCapacity(
         demand_cb_idx, 0,
@@ -205,44 +195,50 @@ def build_ortools_model(locations, dist_matrix, dur_matrix, request: Optimizatio
         True, "Capacity"
     )
 
-    # Mesafe dimension
     routing.AddDimension(dist_cb_idx, 0, 999_999_999, True, "Distance")
-
-    # Zaman dimension
     routing.AddDimension(time_cb_idx, 999_999, 999_999, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
 
-    # FIX: SetValue yerine SetMin+SetMax — araç başlangıç saatini garanti kilitler
+    # Araç başlangıç saatini kilitle
     for vehicle_id in range(request.vehicle_count):
         start_var = time_dim.CumulVar(routing.Start(vehicle_id))
         start_var.SetMin(request.route_start_time)
         start_var.SetMax(request.route_start_time)
 
-    # FIX: time window — route_start_time'dan önceye izin verme + penalty 50000
+    # FIX: Time window conflict — route_start_time > job time_end olduğunda
+    # (kullanıcı akşam saati seçip job'lara öğleden önce window verirse)
+    # time_end'i route_start_time'a göre kaydır, çelişki oluşturma.
     for i in range(1, n):
         index = manager.NodeToIndex(i)
         start_t = locations[i]["time_start"]
         end_t = locations[i]["time_end"]
         if start_t > end_t:
             start_t, end_t = end_t, start_t
-        effective_start = max(start_t, request.route_start_time)
-        time_dim.CumulVar(index).SetMin(effective_start)
-        time_dim.SetCumulVarSoftUpperBound(index, end_t, 50000)
 
-    # Durak sayısı dimension
+        effective_start = max(start_t, request.route_start_time)
+
+        # Eğer time_end, route_start_time'dan önceye denk geliyorsa
+        # (job default 18:00, kullanıcı 20:30 başlattıysa gibi)
+        # window'u route_start_time'dan itibaren başlat, orijinal genişliği koru
+        if end_t <= request.route_start_time:
+            window_duration = end_t - start_t if end_t > start_t else 60
+            effective_end = effective_start + max(window_duration, 60)
+        else:
+            effective_end = end_t
+
+        time_dim.CumulVar(index).SetMin(effective_start)
+        time_dim.SetCumulVarSoftUpperBound(index, effective_end, 50000)
+
     def stop_count_cb(from_index):
         return 1
     stop_cb_idx = routing.RegisterUnaryTransitCallback(stop_count_cb)
     routing.AddDimension(stop_cb_idx, 0, n + 1, True, "StopCount")
 
-    # Katsayılar — birim normalize edildi
     num_stops = n - 1
     stops_per_vehicle = max(1, num_stops // request.vehicle_count)
     METER_PER_MINUTE = 300
-
     sample = [dist_matrix[0][j] for j in range(1, min(n, 11))]
     AVG_STOP_DIST = int(sum(sample) / len(sample)) if sample else 3000
-
     stop_dim = routing.GetDimensionOrDie("StopCount")
 
     if request.optimization_goal == "vehicles":
@@ -250,22 +246,17 @@ def build_ortools_model(locations, dist_matrix, dur_matrix, request: Optimizatio
         dynamic_fixed_cost = max(int(avg_route_cost * 1.5), 30_000)
         routing.SetFixedCostOfAllVehicles(dynamic_fixed_cost)
         logger.info(f"Vehicles modu — dynamic fixed cost: {dynamic_fixed_cost}m")
-
     else:
-        # FIX: sadece matematiksel olarak mümkün araç sayısını zorla
         max_forceable = min(request.vehicle_count, num_stops)
         force_penalty = AVG_STOP_DIST * 2
         for vehicle_id in range(max_forceable):
             stop_dim.SetCumulVarSoftLowerBound(
                 routing.End(vehicle_id), 1, force_penalty
             )
-
         if request.optimization_goal == "distance":
             pass
-
         elif request.optimization_goal == "balance":
             stop_dim.SetGlobalSpanCostCoefficient(AVG_STOP_DIST)
-
         elif request.optimization_goal == "makespan":
             time_dim.SetGlobalSpanCostCoefficient(METER_PER_MINUTE)
 
@@ -274,9 +265,6 @@ def build_ortools_model(locations, dist_matrix, dur_matrix, request: Optimizatio
 
 def solve_with_ortools(routing, manager, time_dim, locations, request, hgs_routes=None, time_limit=35):
     search_params = pywrapcp.DefaultRoutingSearchParameters()
-
-    # HGS hint aktarımı Hafta 2'de ALNS warm-start olarak yapılacak
-    # Şimdilik her modda SAVINGS — en güvenilir başlangıç stratejisi
     search_params.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.SAVINGS
     )
@@ -322,7 +310,8 @@ def extract_routes(solution, routing, manager, time_dim, locations, request) -> 
             path_stops.append({
                 "lat": loc["lat"], "lon": loc["lon"],
                 "id": loc["id"], "demand": loc["demand"],
-                "arrival_time": arr_str
+                "arrival_time": arr_str,
+                "arrival_minutes": arrival_min
             })
             index = solution.Value(routing.NextVar(index))
 
@@ -340,7 +329,8 @@ def extract_routes(solution, routing, manager, time_dim, locations, request) -> 
             path_stops.append({
                 "lat": depot.lat, "lon": depot.lon,
                 "id": depot.id, "demand": 0,
-                "arrival_time": arr_str
+                "arrival_time": arr_str,
+                "arrival_minutes": end_arrival
             })
 
         geometry, true_distance = get_route_geometry(path_stops)
@@ -350,7 +340,8 @@ def extract_routes(solution, routing, manager, time_dim, locations, request) -> 
                 "lat": s["lat"], "lon": s["lon"],
                 "original_id": s["id"],
                 "demand": s["demand"],
-                "arrival_time": s["arrival_time"]
+                "arrival_time": s["arrival_time"],
+                "arrival_minutes": s["arrival_minutes"]
             }
             for i, s in enumerate(path_stops)
         ]
@@ -369,6 +360,35 @@ def extract_routes(solution, routing, manager, time_dim, locations, request) -> 
 # =============================================================================
 # DASHBOARD HTML
 # =============================================================================
+
+def minutes_to_gantt_date(arrival_minutes: int, duration_minutes: int) -> tuple:
+    """
+    Dakika cinsinden varış zamanını Gantt için JS Date objelerine çevirir.
+    Gece yarısını geçen saatleri doğru handle eder (day=1 kullanır).
+    """
+    start_total = arrival_minutes
+    end_total = arrival_minutes + duration_minutes
+
+    start_day = 0
+    if start_total >= 1440:  # 24 saat = 1440 dakika
+        start_day = start_total // 1440
+        start_total = start_total % 1440
+
+    end_day = 0
+    if end_total >= 1440:
+        end_day = end_total // 1440
+        end_total = end_total % 1440
+
+    sh = start_total // 60
+    sm = start_total % 60
+    eh = end_total // 60
+    em = end_total % 60
+
+    return (
+        f"new Date(0,0,{start_day},{sh},{sm},0)",
+        f"new Date(0,0,{end_day},{eh},{em},0)"
+    )
+
 
 def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
     if not result_json.get("routes"):
@@ -443,7 +463,7 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
             orj_id = stop["original_id"]
             lat, lon = stop["lat"], stop["lon"]
             order = stop["order"]
-            arrival = stop.get("arrival_time", "")
+            arrival_minutes = stop.get("arrival_minutes", 480)
 
             if orj_id == 0:
                 if order == 1:
@@ -465,21 +485,16 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
                     )
                 ).add_to(m)
 
-            if arrival:
-                h, m_minute = map(int, arrival.split(":"))
-                duration = service_time if orj_id != 0 else 5
-                end_m = m_minute + duration
-                end_h = (h + (end_m // 60)) % 24
-                end_m = end_m % 60
-                stop_label = (
-                    f"Stop {order - 1}" if orj_id != 0
-                    else ("Depot Departure" if order == 1 else "Depot Return")
-                )
-                gantt_data.append(
-                    f"[ '{v_name}', '{stop_label}', "
-                    f"new Date(0,0,0,{h},{m_minute},0), "
-                    f"new Date(0,0,0,{end_h},{end_m},0) ]"
-                )
+            # FIX: Gantt midnight overflow — arrival_minutes ile çalış, saat string'i değil
+            duration = service_time if orj_id != 0 else 5
+            stop_label = (
+                f"Stop {order - 1}" if orj_id != 0
+                else ("Depot Departure" if order == 1 else "Depot Return")
+            )
+            gantt_start, gantt_end = minutes_to_gantt_date(arrival_minutes, duration)
+            gantt_data.append(
+                f"[ '{v_name}', '{stop_label}', {gantt_start}, {gantt_end} ]"
+            )
 
     gantt_rows_str = ",\n".join(gantt_data)
     js_colors_array = "[" + ",".join([f"'{c}'" for c in active_vehicle_colors]) + "]"
