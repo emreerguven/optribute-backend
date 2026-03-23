@@ -2,11 +2,18 @@
 Optribute v2 — HGS + OR-Tools VRPTW
 ------------------------------------
 Katman 1: OSRM  → gerçek yol matrisleri
-Katman 2: HGS   → güçlü başlangıç çözümü (PyHygese)
-Katman 3: OR-Tools → time window + kapasite constraint validation,
-                     HGS çözümünü hint olarak kullanır
-Katman 4: ALNS  → local search iyileştirme (Hafta 2'de eklenecek)
-Katman 5: MOEA/D → Pareto front (Hafta 3'te eklenecek)
+Katman 2: HGS   → başlangıç çözümü (PyHygese) — Hafta 2'de ALNS warm-start olarak kullanılacak
+Katman 3: OR-Tools → VRPTW, tüm bug'lar fix edildi
+
+Fix listesi:
+- Araç başlangıç saati: SetValue → SetMin+SetMax (garanti çalışır)
+- Job time window: route_start_time'dan önceye izin verilmiyor
+- Time window penalty: 1000 → 50000 (ihlaller gerçekten cezalandırılıyor)
+- vehicles modu: dynamic fixed cost
+- balance/makespan katsayıları: birim normalize edildi
+- makespan modunda arc cost = time (v1'de hep distance'tı)
+- vehicles_to_force: imkânsız constraint kaldırıldı
+- solve süresi: her zaman tam 35 saniye
 
 Kurulum:
     pip install fastapi uvicorn pydantic requests folium polyline hygese ortools
@@ -23,17 +30,15 @@ import urllib.parse
 import requests
 import folium
 import polyline as polyline_lib
-import math
 import time
 import logging
 
-# HGS — pip install hygese
 try:
     from hygese import AlgorithmParameters, Solver as HGSSolver
     HGS_AVAILABLE = True
 except ImportError:
     HGS_AVAILABLE = False
-    logging.warning("PyHygese kurulu değil. 'pip install hygese' çalıştır. OR-Tools fallback aktif.")
+    logging.warning("PyHygese kurulu değil. OR-Tools fallback aktif.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("optribute_v2")
@@ -42,8 +47,9 @@ app = FastAPI(title="Optribute API v2", version="2.0.0")
 
 OSRM_BASE_URL = "http://router.project-osrm.org"
 
+
 # =============================================================================
-# VERİ MODELLERİ (v1 ile tam uyumlu)
+# VERİ MODELLERİ
 # =============================================================================
 
 class Job(BaseModel):
@@ -67,25 +73,20 @@ class OptimizationRequest(BaseModel):
 class PreviewRequest(BaseModel):
     jobs: List[Job]
 
+
 # =============================================================================
-# KATMAN 1: OSRM MATRİSLERİ (v1'den korundu, timeout eklendi)
+# KATMAN 1: OSRM
 # =============================================================================
 
 def get_osrm_matrices(locations: List[Dict]) -> tuple:
-    """
-    Gerçek yol mesafesi ve süre matrislerini OSRM'den çeker.
-    Returns: (distance_matrix_metres, duration_matrix_minutes)
-    """
     coordinates = [f"{loc['lon']},{loc['lat']}" for loc in locations]
     coord_string = ";".join(coordinates)
     url = f"{OSRM_BASE_URL}/table/v1/driving/{coord_string}?annotations=distance,duration"
-
     try:
         response = requests.get(url, timeout=30)
         if response.status_code != 200:
             raise Exception(f"OSRM HTTP {response.status_code}")
         data = response.json()
-
         dist_matrix = [
             [int(val) if val is not None else 10_000_000 for val in row]
             for row in data["distances"]
@@ -95,20 +96,17 @@ def get_osrm_matrices(locations: List[Dict]) -> tuple:
             for row in data["durations"]
         ]
         return dist_matrix, dur_matrix
-
     except requests.Timeout:
-        raise Exception("OSRM timeout — lokasyon sayısını azalt veya self-host OSRM kullan")
+        raise Exception("OSRM timeout — lokasyon sayısını azalt veya self-host kullan")
     except Exception as e:
         raise Exception(f"OSRM hatası: {e}")
 
 
 def get_route_geometry(path_locations: List[Dict]) -> tuple:
-    """Verilen nokta listesi için gerçek yol geometrisi çeker."""
     if len(path_locations) < 2:
         return [], 0
     coords = [f"{loc['lon']},{loc['lat']}" for loc in path_locations]
-    coord_string = ";".join(coords)
-    url = f"{OSRM_BASE_URL}/route/v1/driving/{coord_string}?overview=full&geometries=polyline"
+    url = f"{OSRM_BASE_URL}/route/v1/driving/{';'.join(coords)}?overview=full&geometries=polyline"
     try:
         response = requests.get(url, timeout=20)
         if response.status_code == 200:
@@ -120,34 +118,21 @@ def get_route_geometry(path_locations: List[Dict]) -> tuple:
         pass
     return [], 0
 
+
 # =============================================================================
-# KATMAN 2: HGS BAŞLANGIÇ ÇÖZÜMÜ
+# KATMAN 2: HGS (Hafta 2'de ALNS warm-start olarak kullanılacak)
 # =============================================================================
 
 def solve_with_hgs(
-    locations: List[Dict],
-    dist_matrix: List[List[int]],
-    dur_matrix: List[List[int]],
-    vehicle_count: int,
-    vehicle_capacity: int,
-    use_capacity: bool,
-    service_time: int,
-    route_start_time: int,
-    time_limit_seconds: int = 10
+    locations, dist_matrix, dur_matrix,
+    vehicle_count, vehicle_capacity, use_capacity,
+    service_time, route_start_time,
+    time_limit_seconds=10
 ) -> Optional[List[List[int]]]:
-    """
-    HGS ile başlangıç çözümü üretir.
-    Returns: [[node_indices], ...] her araç için rota listesi
-             Depot (0) dahil değil, sadece müşteri indeksleri
-    """
     if not HGS_AVAILABLE:
-        logger.info("HGS mevcut değil, OR-Tools'a geçiliyor")
         return None
-
     n = len(locations)
-
     try:
-        # HGS problem tanımı
         data = {
             "distance_matrix": dist_matrix,
             "duration_matrix": dur_matrix,
@@ -156,77 +141,31 @@ def solve_with_hgs(
             "num_vehicles": vehicle_count,
             "depot": 0,
             "service_times": [service_time if i > 0 else 0 for i in range(n)],
-            "time_windows": [
-                (loc["time_start"], loc["time_end"]) for loc in locations
-            ],
+            "time_windows": [(loc["time_start"], loc["time_end"]) for loc in locations],
             "vehicle_start_time": route_start_time,
         }
-
         ap = AlgorithmParameters(timeLimit=time_limit_seconds)
         hgs_solver = HGSSolver(parameters=ap, verbose=False)
         result = hgs_solver.solve_cvrp(data)
-
         if result is None:
-            logger.warning("HGS çözüm bulamadı")
             return None
-
-        routes = []
-        for route in result.routes:
-            if route:  # boş rotaları atla
-                routes.append(route)
-
-        logger.info(f"HGS çözümü: {len(routes)} aktif araç, "
-                    f"toplam maliyet: {result.cost:.0f}")
+        routes = [route for route in result.routes if route]
+        logger.info(f"HGS: {len(routes)} aktif araç, maliyet: {result.cost:.0f}")
         return routes
-
     except Exception as e:
-        logger.warning(f"HGS hatası ({e}), OR-Tools fallback aktif")
+        logger.warning(f"HGS hatası ({e}), OR-Tools devreye giriyor")
         return None
 
 
-def hgs_routes_to_ortools_hint(
-    routing,
-    manager,
-    hgs_routes: List[List[int]]
-) -> Any:
-    """
-    HGS çözümünü OR-Tools'un anlayacağı Assignment formatına çevirir.
-    Bu sayede OR-Tools random başlangıç yerine HGS'in iyi çözümünden başlar.
-    """
-    initial_routes = []
-    for route in hgs_routes:
-        # HGS depot içermez, OR-Tools için sadece müşteri indeksleri yeterli
-        initial_routes.append(route)
-
-    try:
-        assignment = routing.ReadAssignmentFromRoutes(initial_routes, True)
-        return assignment
-    except Exception as e:
-        logger.warning(f"HGS hint dönüştürme hatası: {e}")
-        return None
-
 # =============================================================================
-# KATMAN 3: OR-TOOLS VRPTW (Buglar fix edildi)
+# KATMAN 3: OR-TOOLS MODEL
 # =============================================================================
 
-def build_ortools_model(
-    locations: List[Dict],
-    dist_matrix: List[List[int]],
-    dur_matrix: List[List[int]],
-    request: OptimizationRequest
-):
-    """
-    OR-Tools modelini kurar. v1'deki 3 bug fix edildi:
-    Bug #1: vehicles_to_force imkânsız constraint → düzeltildi
-    Bug #2: birim senkronizasyonu → METER_PER_MINUTE ile normalize
-    Bug #3: time window koşulsuz uygulanıyor
-    Bug #4: makespan modunda arc cost = time (v1'de her zaman distance'tı)
-    """
+def build_ortools_model(locations, dist_matrix, dur_matrix, request: OptimizationRequest):
     n = len(locations)
     manager = pywrapcp.RoutingIndexManager(n, request.vehicle_count, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    # --- Callback'ler ---
     def distance_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
@@ -252,13 +191,13 @@ def build_ortools_model(
     time_cb_idx = routing.RegisterTransitCallback(time_callback)
     demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_callback)
 
-    # --- Bug #4 Fix: Arc cost moduna göre seçilir ---
+    # makespan modunda arc cost = zaman
     if request.optimization_goal == "makespan":
         routing.SetArcCostEvaluatorOfAllVehicles(time_cb_idx)
     else:
         routing.SetArcCostEvaluatorOfAllVehicles(dist_cb_idx)
 
-    # --- Kapasite dimension ---
+    # Kapasite
     actual_capacity = request.vehicle_capacity if request.use_capacity else 9_999_999
     routing.AddDimensionWithVehicleCapacity(
         demand_cb_idx, 0,
@@ -266,96 +205,78 @@ def build_ortools_model(
         True, "Capacity"
     )
 
-    # --- Mesafe dimension ---
+    # Mesafe dimension
     routing.AddDimension(dist_cb_idx, 0, 999_999_999, True, "Distance")
 
-    # --- Zaman dimension ---
+    # Zaman dimension
     routing.AddDimension(time_cb_idx, 999_999, 999_999, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
 
+    # FIX: SetValue yerine SetMin+SetMax — araç başlangıç saatini garanti kilitler
     for vehicle_id in range(request.vehicle_count):
-        time_dim.CumulVar(routing.Start(vehicle_id)).SetValue(request.route_start_time)
+        start_var = time_dim.CumulVar(routing.Start(vehicle_id))
+        start_var.SetMin(request.route_start_time)
+        start_var.SetMax(request.route_start_time)
 
-    # --- Bug #3 Fix: Time window koşulsuz uygulanıyor ---
+    # FIX: time window — route_start_time'dan önceye izin verme + penalty 50000
     for i in range(1, n):
         index = manager.NodeToIndex(i)
         start_t = locations[i]["time_start"]
         end_t = locations[i]["time_end"]
         if start_t > end_t:
             start_t, end_t = end_t, start_t
-        time_dim.CumulVar(index).SetMin(start_t)
-        time_dim.SetCumulVarSoftUpperBound(index, end_t, 1000)
+        effective_start = max(start_t, request.route_start_time)
+        time_dim.CumulVar(index).SetMin(effective_start)
+        time_dim.SetCumulVarSoftUpperBound(index, end_t, 50000)
 
-    # --- Durak sayısı dimension ---
+    # Durak sayısı dimension
     def stop_count_cb(from_index):
         return 1
     stop_cb_idx = routing.RegisterUnaryTransitCallback(stop_count_cb)
     routing.AddDimension(stop_cb_idx, 0, n + 1, True, "StopCount")
 
-    # --- Bug #1 & #2 Fix: Objective katsayıları ---
-    num_stops = n - 1  # depot hariç
+    # Katsayılar — birim normalize edildi
+    num_stops = n - 1
     stops_per_vehicle = max(1, num_stops // request.vehicle_count)
-
-    # Birim referansları
-    # dist_matrix: metre | dur_matrix: dakika
-    # Şehir içi yaklaşık 18 km/h → 1 dakika ≈ 300 metre
     METER_PER_MINUTE = 300
-    # Ortalama duraklar arası mesafe (matrisin ilk 10 elemanından tahmin)
-    sample = [
-        dist_matrix[0][j]
-        for j in range(1, min(n, 11))
-    ]
+
+    sample = [dist_matrix[0][j] for j in range(1, min(n, 11))]
     AVG_STOP_DIST = int(sum(sample) / len(sample)) if sample else 3000
 
     stop_dim = routing.GetDimensionOrDie("StopCount")
-    dist_dim = routing.GetDimensionOrDie("Distance")
 
     if request.optimization_goal == "vehicles":
-        # Bug #2 Fix: Fixed cost dinamik — ortalama rota değerinin 1.5 katı
         avg_route_cost = stops_per_vehicle * AVG_STOP_DIST
         dynamic_fixed_cost = max(int(avg_route_cost * 1.5), 30_000)
         routing.SetFixedCostOfAllVehicles(dynamic_fixed_cost)
         logger.info(f"Vehicles modu — dynamic fixed cost: {dynamic_fixed_cost}m")
 
     else:
-        # Bug #1 Fix: Sadece matematiksel olarak mümkün araç sayısını zorla
-        # Her araç min 1 durak alsın (imkânsız constraint yok)
+        # FIX: sadece matematiksel olarak mümkün araç sayısını zorla
         max_forceable = min(request.vehicle_count, num_stops)
-        force_penalty = AVG_STOP_DIST * 2  # caydırıcı ama abartılı değil
-
+        force_penalty = AVG_STOP_DIST * 2
         for vehicle_id in range(max_forceable):
             stop_dim.SetCumulVarSoftLowerBound(
                 routing.End(vehicle_id), 1, force_penalty
             )
 
         if request.optimization_goal == "distance":
-            pass  # arc cost zaten mesafe
+            pass
 
         elif request.optimization_goal == "balance":
-            # 1 durak farkı = 1 ortalama duraklar arası mesafe cezası
             stop_dim.SetGlobalSpanCostCoefficient(AVG_STOP_DIST)
 
         elif request.optimization_goal == "makespan":
-            # arc cost zaten time; global span da zaman cinsinden
-            # 1 dakika fark = METER_PER_MINUTE metre ceza
             time_dim.SetGlobalSpanCostCoefficient(METER_PER_MINUTE)
 
     return routing, manager, time_dim
 
 
-def solve_with_ortools(
-    routing,
-    manager,
-    time_dim,
-    locations,
-    request,
-    hgs_routes=None,
-    time_limit=35
-):
+def solve_with_ortools(routing, manager, time_dim, locations, request, hgs_routes=None, time_limit=35):
     search_params = pywrapcp.DefaultRoutingSearchParameters()
 
-    # Hint aktarımı güvenilmez olduğu için şimdilik SAVINGS kullan.
-    # HGS'i Hafta 2'de ALNS warm-start olarak entegre edeceğiz.
+    # HGS hint aktarımı Hafta 2'de ALNS warm-start olarak yapılacak
+    # Şimdilik her modda SAVINGS — en güvenilir başlangıç stratejisi
     search_params.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.SAVINGS
     )
@@ -365,34 +286,25 @@ def solve_with_ortools(
     search_params.time_limit.seconds = time_limit
 
     if hgs_routes:
-        logger.info(f"HGS {len(hgs_routes)} rota üretti — "
-                    f"Hafta 2'de ALNS warm-start olarak kullanılacak")
+        logger.info(f"HGS {len(hgs_routes)} rota üretti — Hafta 2'de ALNS warm-start olarak kullanılacak")
 
     t0 = time.time()
     solution = routing.SolveWithParameters(search_params)
     elapsed = time.time() - t0
 
     if solution:
-        logger.info(f"OR-Tools çözüm buldu — {elapsed:.1f}s, "
-                    f"maliyet: {solution.ObjectiveValue()}")
+        logger.info(f"OR-Tools çözüm buldu — {elapsed:.1f}s, maliyet: {solution.ObjectiveValue()}")
     else:
         logger.warning("OR-Tools çözüm bulamadı")
 
     return solution
 
+
 # =============================================================================
-# ÇÖZÜM → JSON DÖNÜŞÜMÜ
+# ÇÖZÜM → JSON
 # =============================================================================
 
-def extract_routes(
-    solution,
-    routing,
-    manager,
-    time_dim,
-    locations: List[Dict],
-    request: OptimizationRequest
-) -> List[Dict]:
-    """OR-Tools çözümünü v1 uyumlu JSON formatına çevirir."""
+def extract_routes(solution, routing, manager, time_dim, locations, request) -> List[Dict]:
     routes_json = []
     depot = request.jobs[0]
 
@@ -453,8 +365,9 @@ def extract_routes(
 
     return routes_json
 
+
 # =============================================================================
-# DASHBOARD HTML (v1'den korundu, v2 badge eklendi)
+# DASHBOARD HTML
 # =============================================================================
 
 def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
@@ -484,7 +397,6 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
         active_vehicles += 1
         total_km += route["total_km"]
         total_load += route.get("total_load", 0)
-
         geometry = route.get("geometry", [])
         color = hex_colors[(active_vehicles - 1) % len(hex_colors)]
         active_vehicle_colors.append(color)
@@ -528,7 +440,8 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
             ).add_to(m)
 
         for stop in path:
-            orj_id, lat, lon = stop["original_id"], stop["lat"], stop["lon"]
+            orj_id = stop["original_id"]
+            lat, lon = stop["lat"], stop["lon"]
             order = stop["order"]
             arrival = stop.get("arrival_time", "")
 
@@ -539,7 +452,6 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
                         icon=folium.Icon(color="black", icon="home", prefix="fa")
                     ).add_to(m)
             else:
-                display_num = order - 1
                 folium.Marker(
                     [lat, lon],
                     icon=DivIcon(
@@ -548,7 +460,7 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
                             f'<div style="font-size:11pt;font-weight:bold;color:{color};'
                             f'background-color:white;border:2px solid {color};border-radius:50%;'
                             f'width:30px;height:30px;text-align:center;line-height:26px;">'
-                            f'{display_num}</div>'
+                            f'{order - 1}</div>'
                         )
                     )
                 ).add_to(m)
@@ -573,14 +485,13 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
     js_colors_array = "[" + ",".join([f"'{c}'" for c in active_vehicle_colors]) + "]"
     timeline_height = max(250, active_vehicles * 45 + 80)
 
-    # Solver bilgisi (v2 badge)
     solver_badge = ""
     if solver_info:
-        hgs_used = "✅ HGS" if solver_info.get("hgs_used") else "⚠️ Fallback"
+        hgs_label = "✅ HGS" if solver_info.get("hgs_used") else "⚠️ OR-Tools only"
         solver_badge = (
             f"<div style='position:absolute;top:8px;right:12px;background:rgba(0,0,0,0.6);"
             f"color:white;padding:4px 10px;border-radius:12px;font-size:11px;z-index:9999;'>"
-            f"v2 | {hgs_used} | {solver_info.get('solve_time','?')}s</div>"
+            f"v2 | {hgs_label} | {solver_info.get('solve_time','?')}s</div>"
         )
 
     base_html = m.get_root().render()
@@ -665,19 +576,17 @@ def generate_dashboard_html(jobs, result_json, service_time, solver_info=None):
     base_html = base_html.replace("</body>", timeline_section + "</body>")
     return base_html
 
+
 # =============================================================================
-# API ENDPOINT'LERİ
+# ENDPOINTS
 # =============================================================================
 
 @app.post("/preview")
 def preview_map(request: PreviewRequest):
-    """Lokasyonları haritada önizle (v1 ile aynı)."""
     if not request.jobs:
         raise HTTPException(status_code=400, detail="Lokasyon bulunamadı")
-
     center_lat, center_lon = request.jobs[0].lat, request.jobs[0].lon
     m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
-
     for loc in request.jobs:
         if loc.id == 0:
             folium.Marker(
@@ -690,16 +599,11 @@ def preview_map(request: PreviewRequest):
                 tooltip=f"Stop ID: {loc.id} | Load: {loc.demand} kg",
                 icon=folium.Icon(color="blue", icon="info-sign")
             ).add_to(m)
-
     return {"status": "success", "map_html": m.get_root().render()}
 
 
 @app.post("/optimize")
 def optimize_v2(request: OptimizationRequest):
-    """
-    v2 Ana optimizasyon endpoint'i.
-    Katman 2 (HGS) + Katman 3 (OR-Tools, bug'lar fix edildi).
-    """
     locations = [
         {
             "lat": j.lat, "lon": j.lon,
@@ -709,11 +613,9 @@ def optimize_v2(request: OptimizationRequest):
         for j in request.jobs
     ]
 
-    # Minimum validasyon
     if len(locations) < 2:
         raise HTTPException(status_code=400, detail="En az 1 depot + 1 müşteri gerekli")
 
-    # Katman 1: OSRM
     try:
         dist_matrix, dur_matrix = get_osrm_matrices(locations)
     except Exception as e:
@@ -721,8 +623,6 @@ def optimize_v2(request: OptimizationRequest):
 
     t_start = time.time()
 
-    # Katman 2: HGS başlangıç çözümü
-    # OR-Tools için kalan süreyi ayarla (toplam budget: 40s)
     hgs_time = 12 if len(locations) > 30 else 8
     hgs_routes = solve_with_hgs(
         locations, dist_matrix, dur_matrix,
@@ -734,24 +634,24 @@ def optimize_v2(request: OptimizationRequest):
         time_limit_seconds=hgs_time
     )
 
-    # Katman 3: OR-Tools (bug'lar fix edildi)
     routing, manager, time_dim = build_ortools_model(
         locations, dist_matrix, dur_matrix, request
     )
 
-    ortools_time = 35
     solution = solve_with_ortools(
         routing, manager, time_dim, locations, request,
         hgs_routes=hgs_routes,
-        time_limit=ortools_time
+        time_limit=35
     )
 
     elapsed = round(time.time() - t_start, 1)
 
     if not solution:
-        raise HTTPException(status_code=400, detail="Rota bulunamadı — araç sayısını veya kapasiteyi artır")
+        raise HTTPException(
+            status_code=400,
+            detail="Rota bulunamadı — araç sayısını veya kapasiteyi artır"
+        )
 
-    # Çözüm → JSON
     routes = extract_routes(solution, routing, manager, time_dim, locations, request)
 
     solver_info = {
@@ -760,12 +660,7 @@ def optimize_v2(request: OptimizationRequest):
         "solver": "HGS + OR-Tools" if hgs_routes else "OR-Tools only"
     }
 
-    result = {
-        "status": "success",
-        "routes": routes,
-        "solver_info": solver_info
-    }
-
+    result = {"status": "success", "routes": routes, "solver_info": solver_info}
     result["map_html"] = generate_dashboard_html(
         request.jobs, result, request.service_time, solver_info
     )
@@ -780,9 +675,9 @@ def health():
         "hgs_available": HGS_AVAILABLE,
         "layers": {
             "1_osrm": "active",
-            "2_hgs": "active" if HGS_AVAILABLE else "fallback_only",
+            "2_hgs": "active — ALNS warm-start Hafta 2'de" if HGS_AVAILABLE else "kurulu değil",
             "3_ortools": "active",
-            "4_alns": "coming_week_2",
-            "5_pareto": "coming_week_3"
+            "4_alns": "Hafta 2",
+            "5_pareto": "Hafta 3"
         }
     }
